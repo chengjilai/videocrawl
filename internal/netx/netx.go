@@ -40,11 +40,15 @@ const (
 
 // Client builds an http.Client for a site with the given dial mode and
 // proxy URL (used when mode is "proxy").
-func Client(dial, proxyURL string) *http.Client {
+// Client builds an http.Client. timeout=0 disables the total request
+// timeout (needed for large file downloads; dial/TLS keep their own
+// timeouts via the transport).
+func Client(dial, proxyURL string, timeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		MaxIdleConns:        64,
 		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     60 * time.Second,
+		DialContext:         (&net.Dialer{Timeout: 20 * time.Second}).DialContext,
 	}
 	switch dial {
 	case "warp-doh":
@@ -54,7 +58,7 @@ func Client(dial, proxyURL string) *http.Client {
 			tr.Proxy = http.ProxyURL(p)
 		}
 	}
-	return &http.Client{Transport: tr, Timeout: 90 * time.Second}
+	return &http.Client{Transport: tr, Timeout: timeout}
 }
 
 // ---- warp-doh dial ----
@@ -105,24 +109,18 @@ func resolveDoh(ctx context.Context, host string) ([]string, error) {
 // dohViaWARP queries Cloudflare DoH through the WARP socks to 1.1.1.1
 // (fixed IP, no recursion into resolveDoh).
 func dohViaWARP(ctx context.Context, host string) ([]string, error) {
-	conn, err := warpSocksConnect(ctx, cloudflareDoH)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	cfg := &tls.Config{ServerName: cloudflareSNI}
-	tc := tls.Client(conn, cfg)
-	if err := tc.HandshakeContext(ctx); err != nil {
-		return nil, err
-	}
-	defer tc.Close()
-	req, _ := http.NewRequest("GET", "https://cloudflare-dns.com/dns-query?name="+url.QueryEscape(host)+"&type=A", nil)
-	req.Header.Set("Accept", "application/dns-json")
+	// Dial the WARP socks to the fixed DoH IP; the transport performs the
+	// TLS handshake with the matching SNI (dns.google). Each dial opens a
+	// fresh socks connection — stateless, safe for transport reuse.
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return tc, nil
+			return warpSocksConnect(ctx, cloudflareDoH)
 		},
+		TLSClientConfig: &tls.Config{ServerName: cloudflareSNI},
 	}
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		"https://"+cloudflareSNI+"/resolve?name="+url.QueryEscape(host)+"&type=A", nil)
+	req.Header.Set("Accept", "application/dns-json")
 	resp, err := (&http.Client{Transport: tr, Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
 		return nil, err
@@ -186,22 +184,37 @@ func warpDohDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	ips, err := resolveDoh(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	var lastErr error
-	for _, ip := range ips {
-		conn, err := warpSocksConnect(ctx, net.JoinHostPort(ip, port))
-		if err == nil {
-			return conn, nil
+	// A cached set can be entirely poisoned (CN DoH fallback answers when the
+	// WARP DoH path was briefly down — verified for ffmuc.media.ccc.de: got
+	// 199.16.158.104 instead of 46.226.127.231). On total dial failure, evict
+	// and re-resolve so a recovered WARP path gets another chance.
+	for attempt := 0; attempt < 3; attempt++ {
+		ips, err := resolveDoh(ctx, host)
+		if err != nil {
+			return nil, err
 		}
-		lastErr = err
+		var lastErr error
+		for _, ip := range ips {
+			conn, err := warpSocksConnect(ctx, net.JoinHostPort(ip, port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		dnsCache.Delete(host)
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no A records for %s", host)
+		}
+		if attempt == 2 {
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no A records for %s", host)
-	}
-	return nil, lastErr
+	return nil, fmt.Errorf("dial %s: exhausted retries", host)
 }
 
 func warpSocksConnect(ctx context.Context, addr string) (net.Conn, error) {

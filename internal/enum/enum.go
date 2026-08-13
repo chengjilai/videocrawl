@@ -501,7 +501,7 @@ func httpClient(cfg sites.Site) *http.Client {
 	if dial == "" {
 		dial = "proxy"
 	}
-	return netx.Client(dial, sites.ProxyURL(cfg))
+	return netx.Client(dial, sites.ProxyURL(cfg), 90*time.Second)
 }
 
 func min(a, b int) int {

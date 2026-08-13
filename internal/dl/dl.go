@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"videocrawl/internal/netx"
 
@@ -134,11 +135,9 @@ func (p *Pool) process(v model.Video) error {
 	if err != nil {
 		if strings.Contains(err.Error(), "is not a valid URL") || strings.Contains(err.Error(), "Unsupported URL") {
 			p.store.MarkSkipped(v.SourceID, v.VideoID, "unsupported url: "+err.Error())
-			p.mu.Lock()
-			p.skip++
-			p.mu.Unlock()
-			return nil
+			return errSkipped
 		}
+		p.store.MarkFailed(v.SourceID, v.VideoID, err.Error())
 		return err
 	}
 	dur := yt.DurationSeconds(meta.Duration)
@@ -158,6 +157,7 @@ func (p *Pool) process(v model.Video) error {
 	// 2. download
 	cmd := yt.DownloadCmd(cfg.Cookies, proxy, p.outDir, cfg.MaxHeight, cfg.DLArgs, v.URL)
 	if err := yt.RunDownload(cmd, nil); err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, err.Error())
 		return err
 	}
 
@@ -165,10 +165,12 @@ func (p *Pool) process(v model.Video) error {
 	// <outDir>/<channel>/ matching the id prefix.
 	path, size, err := findOutput(p.outDir, v.VideoID)
 	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "output locate: "+err.Error())
 		return fmt.Errorf("output locate: %w", err)
 	}
 	hash, err := fileSHA256(path)
 	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "hash: "+err.Error())
 		return fmt.Errorf("hash: %w", err)
 	}
 	title := meta.Title
@@ -245,8 +247,9 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	}
 	if len(files) == 0 && src.Site == "ccc" {
 		// list endpoint omits recordings: fetch the event detail
-		files, err = cccEventFiles(v.URL)
+		files, err = cccEventFiles(v.URL, cfg.MaxHeight)
 		if err != nil {
+			p.store.MarkFailed(v.SourceID, v.VideoID, "ccc detail: "+err.Error())
 			return fmt.Errorf("ccc detail: %w", err)
 		}
 	}
@@ -272,7 +275,7 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		p.store.MarkSkipped(v.SourceID, v.VideoID, "no video recording")
 		return errSkipped
 	}
-	client := netx.Client("warp-doh", "")
+	client := netx.Client("warp-doh", "", 0) // no total timeout: large files
 	channel := sanitize(v.Channel)
 	if channel == "" {
 		channel = "unknown"
@@ -299,10 +302,12 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		return p.store.MarkDownloaded(upd)
 	}
 	if err := fetchResume(client, videoFile.URL, base+".part", base); err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "fetch: "+err.Error())
 		return fmt.Errorf("fetch %s: %w", videoFile.URL, err)
 	}
 	hash, err := fileSHA256(base)
 	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "hash: "+err.Error())
 		return err
 	}
 	upd := model.Video{SourceID: v.SourceID, VideoID: v.VideoID, Title: v.Title,
@@ -320,22 +325,37 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	return nil
 }
 
-// fetchResume downloads url to tmp, resuming from tmp's current size via
-// Range; on success renames tmp -> dst (atomic).
+// fetchResume downloads url to tmp with Range resume, retrying on
+// connection drops (WARP egress is flaky on long transfers — verified:
+// mid-stream EOF). Each attempt continues from tmp's current size; on
+// success the tmp file is renamed to dst (atomic).
 func fetchResume(client *http.Client, url, tmp, dst string) error {
-	resume := int64(0)
-	if fi, err := os.Stat(tmp); err == nil {
-		resume = fi.Size()
+	const maxAttempts = 8
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := fetchOnce(client, url, tmp)
+		if err == nil {
+			return os.Rename(tmp, dst)
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
 	}
+	return lastErr
+}
+
+func fetchOnce(client *http.Client, url, tmp string) error {
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	resume, _ := f.Stat()
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "videocrawl/1.0")
-	if resume > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resume))
+	if resume.Size() > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resume.Size()))
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -345,26 +365,23 @@ func fetchResume(client *http.Client, url, tmp, dst string) error {
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
 		return fmt.Errorf("http %d", resp.StatusCode)
 	}
-	if resp.StatusCode == 200 && resume > 0 {
-		// server ignored Range: restart
+	restart := resp.StatusCode == 200 && resume.Size() > 0
+	if restart {
 		f.Truncate(0)
 		f.Seek(0, 0)
 	}
-	n, err := io.Copy(f, resp.Body)
+	_, err = io.Copy(f, resp.Body)
 	if err != nil {
 		return err
 	}
-	if resp.ContentLength >= 0 && resume+n != resp.ContentLength+resume && resp.StatusCode == 206 {
-		// Content-Length is the remaining range; accept >= case
-	}
 	f.Sync()
-	f.Close()
-	return os.Rename(tmp, dst)
+	return nil
 }
 
 // cccEventFiles fetches one event's detail and picks video+sub recordings.
-func cccEventFiles(eventURL string) ([]model.File, error) {
-	client := netx.Client("warp-doh", "")
+// maxHeight<=480 prefers the sd variants (smaller files; the hd are 4-8x).
+func cccEventFiles(eventURL string, maxHeight int) ([]model.File, error) {
+	client := netx.Client("warp-doh", "", 0) // no total timeout: large files
 	resp, err := client.Get(eventURL)
 	if err != nil {
 		return nil, err
@@ -385,8 +402,12 @@ func cccEventFiles(eventURL string) ([]model.File, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
 		return nil, err
 	}
+	pref := []string{"h264-hd", "mp4", "h264-sd", "webm-hd", "webm-sd"}
+	if maxHeight > 0 && maxHeight <= 480 {
+		pref = []string{"h264-sd", "webm-sd", "h264-hd", "mp4", "webm-hd"}
+	}
 	var files []model.File
-	for _, want := range []string{"h264-hd", "mp4", "h264-sd", "webm-hd", "webm-sd"} {
+	for _, want := range pref {
 		for _, r := range e.Recordings {
 			if strings.Contains(r.Filename, want) && strings.HasPrefix(r.MimeType, "video/") {
 				files = append(files, model.File{URL: r.URL, Size: r.Size << 20, Ext: extOf(r.Filename), Kind: "video"})
