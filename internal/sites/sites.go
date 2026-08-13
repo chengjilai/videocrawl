@@ -34,7 +34,9 @@ func Defaults() map[string]Site {
 			// default client: tv client DRMs formats without cookies. If a
 			// channel 403s, override via sites.json:
 			//   EnumArgs/DLArgs: ["--extractor-args", "youtube:player_client=tv"]
-			EnumArgs: []string{},
+			// approximate_date: channel-tab/UU flat entries otherwise lack
+			// upload_date, breaking the oldest-first queue order.
+			EnumArgs: []string{"--extractor-args", "youtubetab:approximate_date=true"},
 			DLArgs:   []string{},
 		},
 		"bilibili": {
