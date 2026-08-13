@@ -3,13 +3,17 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"videocrawl/internal/yt"
 
 	"videocrawl/internal/dl"
 	"videocrawl/internal/enum"
@@ -71,15 +75,27 @@ func normalize(kind, raw, query string) (string, string, error) {
 	raw = strings.TrimSpace(raw)
 	switch kind {
 	case model.KindYoutubeChannel:
+		if strings.HasPrefix(raw, "UC") && len(raw) == 24 {
+			return "https://www.youtube.com/playlist?list=UU" + raw[2:], "", nil
+		}
 		if !strings.HasPrefix(raw, "http") {
-			if strings.HasPrefix(raw, "UC") && len(raw) == 24 {
-				return "https://www.youtube.com/channel/" + raw, "", nil
-			}
-			if strings.HasPrefix(raw, "@") {
-				return "https://www.youtube.com/" + raw, "", nil
+			raw = "https://www.youtube.com/" + strings.TrimPrefix(raw, "@")
+		}
+		if i := strings.Index(raw, "channel/UC"); i >= 0 {
+			uc := raw[i+len("channel/"):]
+			uc = strings.SplitN(uc, "/", 2)[0]
+			if len(uc) == 24 {
+				return "https://www.youtube.com/playlist?list=UU" + uc[2:], "", nil
 			}
 		}
-		return raw, "", nil
+		id, err := resolveChannelID(raw)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve channel: %w", err)
+		}
+		if !strings.HasPrefix(id, "UC") || len(id) != 24 {
+			return "", "", fmt.Errorf("unexpected channel id %q", id)
+		}
+		return "https://www.youtube.com/playlist?list=UU" + id[2:], "", nil
 	case model.KindYoutubePlaylist:
 		if !strings.HasPrefix(raw, "http") {
 			return "https://www.youtube.com/playlist?list=" + raw, "", nil
@@ -128,6 +144,35 @@ func normalize(kind, raw, query string) (string, string, error) {
 		return raw, "", nil
 	}
 	return "", "", fmt.Errorf("unknown kind %q", kind)
+}
+
+// resolveChannelID: one yt-dlp metadata call to turn a handle/URL into a
+// channel id. Uses the env proxy (youtube is GFW-blocked).
+func resolveChannelID(rawurl string) (string, error) {
+	proxy := os.Getenv("VIDEOCRAWL_PROXY")
+	if proxy == "" {
+		proxy = "http://127.0.0.1:8888"
+	}
+	args := []string{"-J", "--no-warnings", "--skip-download", "--proxy", proxy, "--", rawurl}
+	cmd := exec.Command(yt.Bin(), args...)
+	out, err := cmd.Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", fmt.Errorf("yt-dlp: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", err
+	}
+	var m struct {
+		ChannelID string `json:"channel_id"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil {
+		return "", err
+	}
+	if m.ChannelID == "" {
+		return "", fmt.Errorf("no channel_id in response")
+	}
+	return m.ChannelID, nil
 }
 
 func allDigits(s string) bool {
