@@ -14,6 +14,8 @@ oldest-first with per-site yt-dlp recipes, and resumes crash-safe.
 | `peertube-channel` / `peertube-search` | native REST, `count=100` pagination to the end | direct |
 | `ccc-conf` / `ccc-search` | native REST (media.ccc.de events) | warp-doh egress |
 | `archive-query` | native scraping API (`services/search/v1/scrape`, cursor-based, 1000/req), advancedsearch fallback | smart-proxy |
+| `archive-audio` | same enumerator as `archive-query`, but normalize pins `mediatype:audio`; downloads are native: item metadata → best format tier (mp3 > flac > ogg), Range-resume fetch of every track (extras in `media_files`) | smart-proxy |
+| `gallica` | one BnF ark per source (single entry; title via SRU). Downloads solve the altcha PoW once per session (cookie), then fetch the PDF | smart-proxy |
 | `rss` | RSS/Atom video enclosures | direct |
 
 No time bias: channel tabs are newest-first feeds, but the crawler walks every
@@ -36,6 +38,9 @@ videocrawl add bilibili-fav 1103260112        # numeric fid, or a favlist URL
 videocrawl add peertube-channel https://tilvids.com/video-channels/fosstodon
 videocrawl add ccc-conf 37c3
 videocrawl add archive-query --query 'mediatype:movies AND collection:opensource_movies'
+videocrawl add archive-audio https://archive.org/advancedsearch.php --query 'collection:great78'  # mediatype:audio auto-appended
+videocrawl add archive-audio https://archive.org/details/SomeAlbum
+videocrawl add gallica https://gallica.bnf.fr/ark:/12148/btv1b52503827w
 videocrawl add rss https://shipit.show/feed
 
 videocrawl enumerate --concurrency 3     # discovery (cheap, polite)
@@ -62,6 +67,24 @@ default 127.0.0.1:40000; `off` disables the probe),
 `VIDEOCRAWL_NO_PROXY_CHECK` (set to 1 to skip the smart-proxy health probe),
 `VIDEOCRAWL_STRIPES` (native ccc stripes per file, default 4, cap 6),
 `VIDEOCRAWL_RATE_CEIL_MB` (per-file ccc rate ceiling, default 4 MiB/s).
+
+## Audio mode (yt-dlp sites)
+
+Set `audioFormat` (one of `mp3` | `flac` | `m4a`) on a yt-dlp site in
+`VIDEOCRAWL_SITES_JSON` to turn that site's downloads into audio extraction
+(`-x --audio-format <fmt> --audio-quality 0`, best audio stream):
+
+```json
+{ "youtube": { "audioFormat": "mp3" } }
+```
+
+`archive-audio` and `gallica` download natively instead (no yt-dlp):
+`archive-audio` picks the item's best audio tier from
+`archive.org/metadata/{id}` and Range-resumes every track into
+`<out>/archive-audio/` (the primary track is recorded on the video row, the
+rest in the `media_files` table); `gallica` streams the ark's PDF into
+`<out>/gallica/`, solving the altcha proof-of-work once per session and
+reusing the verified cookie.
 
 ## Unattended operation
 

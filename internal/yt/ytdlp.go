@@ -154,7 +154,9 @@ func GetMeta(extra []string, cookies, proxy, url string) (*MetaEntry, error) {
 // DownloadCmd builds the per-video download command. Recipe from research:
 // 720p H.264 mp4 archive-grade, unique per-video output path (id kills
 // title collisions), .part temp on the same filesystem, resume, en subs.
-func DownloadCmd(cookies, proxy, outDir string, maxHeight int, extra []string, url string) *exec.Cmd {
+// With audioFormat != "" the download is audio-only: -x extracts the best
+// audio (--audio-quality 0 = best), converted to the requested format.
+func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat string, extra []string, url string) *exec.Cmd {
 	args := []string{
 		"--no-playlist",
 		"-w", "--continue", "--no-overwrites",
@@ -171,12 +173,18 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, extra []string, u
 		"--no-warnings",
 		"--socket-timeout", "60", // a hung socket must not stall the round forever
 	}
-	if maxHeight > 0 {
+	switch {
+	case audioFormat != "":
+		// audio mode: best available audio stream, extracted to the target
+		// format; -x picks the container, so no merge/remux args.
+		args = append(args, "-x", "--audio-format", audioFormat, "--audio-quality", "0")
+		args = append(args, "-f", "ba/b")
+	case maxHeight > 0:
 		f := fmt.Sprintf("bv*[height<=%d]+ba/b", maxHeight)
 		args = append(args, "-f", f)
 		args = append(args, "-S", "vcodec:h264,res:720,fps,hdr:12,acodec:m4a")
 		args = append(args, "--merge-output-format", "mp4", "--remux-video", "mp4")
-	} else {
+	default:
 		args = append(args, "-f", "bv*+ba/b")
 		args = append(args, "--merge-output-format", "mp4")
 	}

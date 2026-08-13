@@ -11,6 +11,8 @@
 //	download [--limit N] [--workers W] [--min-dur S] [--max-dur S]
 //	         [--skip-shorts] [--skip-live]
 //	crawl-loop [--every SEC] [--limit N] [--workers W] [--rounds N]
+//	upload [--limit N] [--dry-run] --upload-allowlist 'cc'|IDs
+//	       [--path-prefix-rewrite OLD:NEW]
 //	status
 //	list [--status X] [--json] [--limit N]
 package main
@@ -94,11 +96,19 @@ func main() {
 		fs.Parse(reorderArgs(args, map[string]bool{}))
 		policy := dl.Policy{MinDuration: *minDur, MaxDuration: *maxDur, SkipShorts: true, SkipLive: true}
 		err = a.CrawlLoop(ctx, *every, *limit, *workers, *rounds, time.Duration(*maxTime)*time.Second, policy)
+	case "upload":
+		fs := flag.NewFlagSet("upload", flag.ExitOnError)
+		limit := fs.Int("limit", 0, "max videos this pass (0=all done)")
+		dryRun := fs.Bool("dry-run", false, "print the would-upload list only")
+		allowlist := fs.String("upload-allowlist", "", "'cc' (CC BY, site=ccc) or comma list of source ids; REQUIRED (licensing gate)")
+		rewrite := fs.String("path-prefix-rewrite", "", "OLD:NEW — rewrite videos.path prefix (lab->aturing sync)")
+		fs.Parse(reorderArgs(args, map[string]bool{"dry-run": true}))
+		err = a.Upload(*limit, *dryRun, *allowlist, *rewrite, a.OutDir)
 	case "status":
 		err = a.Status()
 	case "list":
 		fs := flag.NewFlagSet("list", flag.ExitOnError)
-		status := fs.String("status", "", "filter: new|done|failed|skipped")
+		status := fs.String("status", "", "filter: new|done|failed|skipped|uploaded")
 		jsonOut := fs.Bool("json", false, "JSONL output")
 		limit := fs.Int("limit", 50, "rows")
 		fs.Parse(reorderArgs(args, map[string]bool{"json": true}))
@@ -119,12 +129,15 @@ func usage() {
   add <kind> <url-or-id> [--name N] [--query Q]
       kinds: youtube-channel youtube-playlist bilibili-space bilibili-fav
              peertube-channel peertube-search ccc-conf ccc-search
-             archive-query rss
+             archive-query archive-audio rss gallica
   rm <id>                     remove a source (and its queued videos)
   enumerate [--concurrency N] [--limit N] [--source ID]
   download  [--limit N] [--workers W] [--min-dur S] [--max-dur S]
             [--skip-shorts] [--skip-live]
   crawl-loop [--every SEC] [--limit N] [--workers W] [--rounds N] [--max-time SEC]
+  upload [--limit N] [--dry-run] --upload-allowlist 'cc'|IDs [--path-prefix-rewrite OLD:NEW]
+      republish done videos to bilibili; --upload-allowlist is mandatory:
+      'cc' = media.ccc.de (CC BY) sources, or a comma list of source ids
   status                      sources + queue counts
   list [--status X] [--json] [--limit N]
 
@@ -132,6 +145,7 @@ env: VIDEOCRAWL_DB (~/videocrawl.db) VIDEOCRAWL_OUT (~/Videos/Crawl)
      VIDEOCRAWL_PROXY (auto sites; default http://127.0.0.1:8888)
      VIDEOCRAWL_COOKIES_DIR (per-site <site>.txt Netscape cookie files)
      VIDEOCRAWL_YTDLP (yt-dlp binary) VIDEOCRAWL_SITES_JSON (overrides)
+     VIDEOCRAWL_UPLOAD_SCRIPT (~/src/bilibili/upload_web.py)
 
 examples:
   videocrawl add youtube-channel https://www.youtube.com/@GNOME/videos
@@ -140,8 +154,12 @@ examples:
   videocrawl add peertube-channel https://tilvids.com/video-channels/fosstodon
   videocrawl add ccc-conf 37c3
   videocrawl add archive-query --query 'mediatype:movies AND licenseurl:[* TO *]'
+  videocrawl add archive-audio https://archive.org/advancedsearch.php --query 'collection:great78'  # mediatype:audio auto-appended
+  videocrawl add archive-audio https://archive.org/details/SomeItem
+  videocrawl add gallica https://gallica.bnf.fr/ark:/12148/btv1b52503827w
   videocrawl add rss https://shipit.show/feed
-  videocrawl crawl-loop --every 3600 --limit 10 --workers 6 --max-time 3600`)
+  videocrawl crawl-loop --every 3600 --limit 10 --workers 6 --max-time 3600
+  videocrawl upload --upload-allowlist cc,3,7 --path-prefix-rewrite /home/sjtu/Videos/Crawl:/home/chengjilai/Videos/Crawl`)
 }
 
 func usageErr(msg string) error { return fmt.Errorf("usage: %s", msg) }

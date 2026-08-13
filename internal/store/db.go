@@ -55,7 +55,8 @@ func (s *Store) init() error {
 			enum_complete INTEGER NOT NULL DEFAULT 0,
 			created TEXT NOT NULL
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_url ON sources(url)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_url_query ON sources(url, query)`,
+		`DROP INDEX IF EXISTS idx_sources_url`,
 		`CREATE TABLE IF NOT EXISTS videos (
 			source_id INTEGER NOT NULL,
 			video_id TEXT NOT NULL,
@@ -70,6 +71,7 @@ func (s *Store) init() error {
 			size_bytes INTEGER NOT NULL DEFAULT 0,
 			path TEXT NOT NULL DEFAULT '',
 			sha256 TEXT NOT NULL DEFAULT '',
+			bvid TEXT NOT NULL DEFAULT '',
 			fetched_at TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (source_id, video_id)
 		)`,
@@ -83,6 +85,16 @@ func (s *Store) init() error {
 			size_bytes INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (source_id, video_id, kind, url)
 		)`,
+		`CREATE TABLE IF NOT EXISTS media_files (
+			source_id INTEGER NOT NULL,
+			video_id TEXT NOT NULL,
+			url TEXT NOT NULL,
+			path TEXT NOT NULL DEFAULT '',
+			sha256 TEXT NOT NULL DEFAULT '',
+			size_bytes INTEGER NOT NULL DEFAULT 0,
+			ext TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (source_id, video_id, url)
+		)`,
 		`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)`,
 	}
 	for _, q := range stmts {
@@ -90,7 +102,39 @@ func (s *Store) init() error {
 			return fmt.Errorf("schema: %w", err)
 		}
 	}
+	// migration: bvid (upload tracking) postdates the original schema, and
+	// CREATE TABLE IF NOT EXISTS never touches existing tables, so add the
+	// column explicitly when an old DB is opened (guard: only when missing).
+	if err := s.ensureColumn("videos", "bvid", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
 	return nil
+}
+
+// ensureColumn adds a column to an existing table when it is missing
+// (CREATE TABLE IF NOT EXISTS cannot migrate old databases).
+func (s *Store) ensureColumn(table, column, decl string) error {
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl))
+	return err
 }
 
 // ---- sources ----
@@ -150,6 +194,7 @@ func (s *Store) GetSource(id int64) (model.Source, error) {
 
 func (s *Store) DeleteSource(id int64) error {
 	for _, q := range []string{
+		`DELETE FROM media_files WHERE source_id=?`,
 		`DELETE FROM video_files WHERE source_id=?`,
 		`DELETE FROM videos WHERE source_id=?`,
 		`DELETE FROM sources WHERE id=?`,
@@ -216,6 +261,24 @@ func (s *Store) GetFiles(srcID int64, videoID string) ([]model.File, error) {
 	return out, rows.Err()
 }
 
+// UpsertMediaFiles records additional files of a downloaded video (e.g.
+// archive-audio tracks beyond the primary).
+func (s *Store) UpsertMediaFiles(srcID int64, videoID string, files []model.MediaFile) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, f := range files {
+		if _, err := tx.Exec(
+			`INSERT OR REPLACE INTO media_files (source_id,video_id,url,path,sha256,size_bytes,ext) VALUES (?,?,?,?,?,?,?)`,
+			srcID, videoID, f.URL, f.Path, f.SHA256, f.SizeBytes, f.Ext); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // UpdateTitle fills in title/date discovered later (e.g. bilibili flat mode
 // returns empty titles).
 func (s *Store) UpdateTitle(srcID int64, videoID, title, published, channel string) error {
@@ -228,11 +291,29 @@ func (s *Store) UpdateTitle(srcID int64, videoID, title, published, channel stri
 // NextForDownload returns up to n videos ready to process, oldest published
 // first (TubeSync lesson: oldest-first so a slow queue doesn't starve old
 // videos; also makes the crawl time-unbiased).
-func (s *Store) NextForDownload(n int) ([]model.Video, error) {
-	rows, err := s.db.Query(
-		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,fetched_at
-		 FROM videos WHERE status IN ('new','failed') AND attempts < 5
-		 ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`, n)
+// NextForDownload picks the next batch, oldest-published first. minDur/maxDur
+// (seconds; 0 = unset) pre-filter on the KNOWN duration so videos that would
+// only be skipped later don't burn queue/limit slots. duration=0 (unknown)
+// always passes.
+func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, error) {
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at
+		 FROM videos WHERE status IN ('new','failed') AND attempts < 5`
+	var args []any
+	if minDur > 0 || maxDur > 0 {
+		q += ` AND (duration = 0`
+		if minDur > 0 {
+			q += ` OR duration >= ?`
+			args = append(args, minDur)
+		}
+		if maxDur > 0 {
+			q += ` OR duration <= ?`
+			args = append(args, maxDur)
+		}
+		q += `)`
+	}
+	q += ` ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`
+	args = append(args, n)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +323,7 @@ func (s *Store) NextForDownload(n int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.FetchedAt); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -250,7 +331,39 @@ func (s *Store) NextForDownload(n int) ([]model.Video, error) {
 	return out, rows.Err()
 }
 
-// CountByStatus for status output.
+// NextForUpload returns up to n downloaded videos not yet republished,
+// oldest published first (same order as the download queue, so the oldest
+// content leaves the frontier first).
+func (s *Store) NextForUpload(n int) ([]model.Video, error) {
+	rows, err := s.db.Query(
+		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at
+		 FROM videos WHERE status=? ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`,
+		model.StatusDone, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Video
+	for rows.Next() {
+		var v model.Video
+		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
+			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// UploadMarked records a successful bilibili upload: the video leaves the
+// upload queue and is never re-uploaded.
+func (s *Store) UploadMarked(srcID int64, videoID, bvid string) error {
+	_, err := s.db.Exec(
+		`UPDATE videos SET status=?, bvid=? WHERE source_id=? AND video_id=?`,
+		model.StatusUploaded, bvid, srcID, videoID)
+	return err
+}
 func (s *Store) CountByStatus() (map[string]int64, error) {
 	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM videos GROUP BY status`)
 	if err != nil {
@@ -271,7 +384,7 @@ func (s *Store) CountByStatus() (map[string]int64, error) {
 
 // VideoRows lists videos filtered by status ("" = all).
 func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
-	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,fetched_at FROM videos`
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at FROM videos`
 	var args []any
 	if status != "" {
 		q += ` WHERE status=?`
@@ -289,7 +402,7 @@ func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.FetchedAt); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -360,8 +473,10 @@ func siteFor(kind string) string {
 		return "peertube"
 	case model.KindCCCConf, model.KindCCCSearch:
 		return "ccc"
-	case model.KindArchiveQuery:
+	case model.KindArchiveQuery, model.KindArchiveAudio:
 		return "archive"
+	case model.KindGallica:
+		return "gallica"
 	case model.KindRSS:
 		return "rss"
 	}

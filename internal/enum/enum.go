@@ -54,8 +54,12 @@ func ForKind(kind string) EnumFunc {
 		return enumPeerTube
 	case "ccc-conf", "ccc-search":
 		return enumCCC
-	case "archive-query":
+	case "archive-query", "archive-audio":
+		// archive-audio enumerates like archive-query; normalize guarantees
+		// the query carries mediatype:audio.
 		return enumArchive
+	case "gallica":
+		return enumGallica
 	case "rss":
 		return enumRSS
 	}

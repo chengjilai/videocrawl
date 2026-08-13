@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Site configures one source family: how to reach it (proxy), and the
@@ -24,6 +26,9 @@ type Site struct {
 	// Dial: transport for REST sources + native downloads: "" (direct),
 	// "proxy" (smart-proxy), "warp-doh" (DoH + WARP socks; media.ccc.de).
 	Dial string `json:"dial"`
+	// AudioFormat: "" = video downloads; otherwise yt-dlp extracts audio
+	// (-x --audio-format <fmt> --audio-quality 0). One of mp3|flac|m4a.
+	AudioFormat string `json:"audioFormat"`
 }
 
 func Defaults() map[string]Site {
@@ -48,12 +53,16 @@ func Defaults() map[string]Site {
 			MaxHeight: 720,
 		},
 		"ccc": {
-			Proxy:     "",        // smart-proxy cannot route it (policy gap)
+			Proxy:     "",         // smart-proxy cannot route it (policy gap)
 			Dial:      "warp-doh", // DoH resolve + WARP socks, verified path
 			MaxHeight: 720,
 		},
 		"archive": {
 			Proxy:     "auto",
+			MaxHeight: 720,
+		},
+		"gallica": {
+			Proxy:     "auto", // BnF via the smart-proxy (direct policy ok)
 			MaxHeight: 720,
 		},
 		"rss": {
@@ -87,6 +96,9 @@ func Load(path string) map[string]Site {
 					}
 					if v.Dial != "" {
 						s.Dial = v.Dial
+					}
+					if v.AudioFormat != "" {
+						s.AudioFormat = v.AudioFormat
 					}
 					if v.Cookies != "" {
 						s.Cookies = v.Cookies
@@ -128,15 +140,124 @@ func ProxyURL(s Site) string {
 	return s.Proxy
 }
 
-// Blocked reports whether a host needs the proxy (GFW set, mirrors the
-// smart-proxy's warp list and techcrawl-go's blockedDomains).
+// --- Egress policy ---------------------------------------------------------
+//
+// Blocked consults the fleet's single egress policy at /etc/egress-policy.json
+// (the same file smart-proxy.py reads; format validated by
+// ~/nixos/scripts/check-egress-policy.py):
+//
+//	{ "default": "warp|direct|doh", "domains": { "<domain>": "warp|direct|doh" } }
+//
+// Most specific suffix wins (longest match, same as smart-proxy). A host
+// whose resolved action is warp (TCP via WARP SOCKS) or doh (DoT resolve)
+// needs the proxy; direct does not. The parsed policy and its mtime are
+// cached, so hot paths pay one stat per call. When the file is unreadable or
+// malformed, Blocked falls back to the baked GFW list below.
+
+const policyPathDefault = "/etc/egress-policy.json"
+
+// bakedBlocked: hosts that need the proxy when the egress policy file is
+// unavailable (mirrors the smart-proxy's warp list).
+var bakedBlocked = []string{
+	"youtube.com", "youtu.be", "googlevideo.com", "ytimg.com",
+	"github.com", "githubusercontent.com",
+	"archive.org", "media.ccc.de", "wikipedia.org",
+}
+
+type egressPolicy struct {
+	Default string            `json:"default"`
+	Domains map[string]string `json:"domains"`
+}
+
+var (
+	policyPath        = policyPathDefault // overridable for tests
+	policyMu          sync.Mutex
+	policyCached      egressPolicy
+	policyCachedMtime time.Time
+	policyCachedOK    bool
+)
+
+// loadPolicy returns the parsed /etc/egress-policy.json (cached by mtime).
+// ok=false means the file is unreadable/malformed and callers must use the
+// baked list; a stale cache is dropped so the fallback is always current.
+func loadPolicy() (egressPolicy, bool) {
+	policyMu.Lock()
+	defer policyMu.Unlock()
+	if fi, err := os.Stat(policyPath); err == nil {
+		if policyCachedOK && fi.ModTime().Equal(policyCachedMtime) {
+			return policyCached, true
+		}
+		if b, err := os.ReadFile(policyPath); err == nil {
+			var pol egressPolicy
+			if json.Unmarshal(b, &pol) == nil {
+				if pol.Default == "" {
+					pol.Default = "direct"
+				}
+				if pol.Domains == nil {
+					pol.Domains = map[string]string{}
+				}
+				policyCached, policyCachedMtime, policyCachedOK = pol, fi.ModTime(), true
+				return pol, true
+			}
+		}
+	}
+	policyCachedOK = false
+	return egressPolicy{}, false
+}
+
+// resetPolicyCache drops the cached policy (tests).
+func resetPolicyCache() {
+	policyMu.Lock()
+	policyCachedOK = false
+	policyMu.Unlock()
+}
+
+// policyAction resolves host to its egress action; most specific suffix wins.
+func policyAction(host string, pol egressPolicy) string {
+	if a, ok := pol.Domains[host]; ok {
+		return a
+	}
+	best := ""
+	for d := range pol.Domains {
+		if len(d) > len(best) && strings.HasSuffix(host, "."+d) {
+			best = d
+		}
+	}
+	if best != "" {
+		return pol.Domains[best]
+	}
+	return pol.Default
+}
+
+// PolicyActions returns the effective domain→action map from
+// /etc/egress-policy.json, for debugging/CLI. When the policy file is
+// unreadable, the baked fallback list is reported with action "warp"
+// (consistent with Blocked's fallback semantics).
+func PolicyActions() map[string]string {
+	if pol, ok := loadPolicy(); ok {
+		m := make(map[string]string, len(pol.Domains))
+		for d, a := range pol.Domains {
+			m[d] = a
+		}
+		return m
+	}
+	m := make(map[string]string, len(bakedBlocked))
+	for _, d := range bakedBlocked {
+		m[d] = "warp"
+	}
+	return m
+}
+
+// Blocked reports whether a host needs the proxy: its egress action (per
+// /etc/egress-policy.json, most specific suffix wins) is warp or doh. Falls
+// back to the baked GFW list when the policy file is unreadable.
 func Blocked(host string) bool {
 	h := strings.ToLower(host)
-	for _, suffix := range []string{
-		"youtube.com", "youtu.be", "googlevideo.com", "ytimg.com",
-		"github.com", "githubusercontent.com",
-		"archive.org", "media.ccc.de", "wikipedia.org",
-	} {
+	if pol, ok := loadPolicy(); ok {
+		a := policyAction(h, pol)
+		return a == "warp" || a == "doh"
+	}
+	for _, suffix := range bakedBlocked {
 		if h == suffix || strings.HasSuffix(h, "."+suffix) {
 			return true
 		}

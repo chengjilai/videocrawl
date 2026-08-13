@@ -13,13 +13,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"videocrawl/internal/enum"
 	"videocrawl/internal/netx"
 
 	"videocrawl/internal/model"
@@ -47,6 +50,9 @@ type Pool struct {
 	done    int
 	fail    int
 	skip    int
+	// shared gallica session (altcha PoW solved once per pool)
+	gallicaMu sync.Mutex
+	gallica   *enum.Gallica
 }
 
 func NewPool(st *store.Store, sites map[string]sites.Site, outDir string, policy Policy, workers int) *Pool {
@@ -84,7 +90,7 @@ func (p *Pool) Run(ctx context.Context, limit int, deadline time.Time) error {
 			fmt.Fprintf(os.Stderr, "download: pass stopped early (time budget/signal)\n")
 			return nil
 		}
-		batch, err := p.store.NextForDownload(p.workers * 2)
+		batch, err := p.store.NextForDownload(p.workers*2, p.policy.MinDuration, p.policy.MaxDuration)
 		if err != nil {
 			return err
 		}
@@ -147,8 +153,9 @@ func (p *Pool) process(v model.Video) error {
 	cfg := p.sites[src.Site]
 	proxy := sites.ProxyURL(cfg)
 
-	// native-download sites (ccc: static files via DoH+WARP, no extractor)
-	if cfg.Dial == "warp-doh" {
+	// native-download sites: ccc (static files via DoH+WARP), archive-audio
+	// (audio files via the site's proxy dial), gallica (PDF via altcha flow).
+	if cfg.Dial == "warp-doh" || src.Kind == model.KindArchiveAudio || src.Kind == model.KindGallica {
 		return p.processNative(v, src, cfg)
 	}
 
@@ -189,7 +196,7 @@ func (p *Pool) process(v model.Video) error {
 	}
 
 	// 2. download
-	cmd := yt.DownloadCmd(cfg.Cookies, proxy, p.outDir, cfg.MaxHeight, cfg.DLArgs, v.URL)
+	cmd := yt.DownloadCmd(cfg.Cookies, proxy, p.outDir, cfg.MaxHeight, cfg.AudioFormat, cfg.DLArgs, v.URL)
 	if err := yt.RunDownload(cmd, nil); err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, err.Error())
 		return err
@@ -255,7 +262,8 @@ func findOutput(outDir, videoID string) (string, int64, error) {
 				continue // temp or fragment files
 			}
 			ext := filepath.Ext(base)
-			if ext != ".mp4" && ext != ".mkv" && ext != ".webm" && ext != ".flv" && ext != ".m4a" {
+			if ext != ".mp4" && ext != ".mkv" && ext != ".webm" && ext != ".flv" &&
+				ext != ".m4a" && ext != ".mp3" && ext != ".flac" && ext != ".opus" && ext != ".ogg" {
 				continue
 			}
 			info, err := f.Info()
@@ -288,11 +296,20 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// processNative: static-file download (media.ccc.de): pick the best video
-// recording + en subtitles recorded at enumeration time, fetch through the
-// warp-doh transport with parallel Range stripes (see fetchStriped), .part
-// -> atomic rename, sha256.
+// processNative: static-file download. Dispatch by kind:
+//   - ccc: pick the best video recording + en subtitles recorded at
+//     enumeration time, fetch through the warp-doh transport with parallel
+//     Range stripes (see fetchStriped), .part -> atomic rename, sha256.
+//   - archive-audio: archive.org metadata -> audio files (mp3>flac>ogg),
+//     Range-resume fetch each, sha256, extras recorded in media_files.
+//   - gallica: PDF score through the altcha PoW + cookie flow.
 func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) error {
+	switch src.Kind {
+	case model.KindArchiveAudio:
+		return p.processArchiveAudio(v, src, cfg)
+	case model.KindGallica:
+		return p.processGallica(v, src, cfg)
+	}
 	files, err := p.store.GetFiles(v.SourceID, v.VideoID)
 	if err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "files: "+err.Error())
@@ -377,6 +394,216 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		}
 	}
 	return nil
+}
+
+// ---- archive-audio native download ----
+
+// iaFile: one file entry of https://archive.org/metadata/<id>.
+type iaFile struct {
+	Name   string `json:"name"`
+	Format string `json:"format"`
+}
+
+// iaMetadata: the parts of the archive.org metadata document we use.
+type iaMetadata struct {
+	Files []iaFile `json:"files"`
+}
+
+// archiveMetadata fetches https://archive.org/metadata/{id} through the
+// site's transport (archive site config: smart-proxy).
+func archiveMetadata(client *http.Client, id string) (*iaMetadata, error) {
+	u := "https://archive.org/metadata/" + url.PathEscape(id)
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("archive.org metadata %d: %s", resp.StatusCode, strings.TrimSpace(string(b))[:min(len(b), 160)])
+	}
+	var m iaMetadata
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// pickAudioFiles selects the audio tracks of an archive.org audio item: the
+// best present format tier wins (mp3 > flac > ogg > other audio) and
+// non-track files (lecture recordings, metadata) are skipped. Metadata order
+// is track order. mp3 is preferred over flac: 78rpm-era transfers are
+// needle-drop audio where the derived mp3 is the portable republishing
+// format (small files, lossy generation is irrelevant), and the crawler's
+// output feeds a size-bounded upload pipeline.
+func pickAudioFiles(files []iaFile) []iaFile {
+	for _, tier := range []string{"mp3", "flac", "ogg", "opus", "m4a", "wav", "aac"} {
+		var chosen []iaFile
+		for _, f := range files {
+			n := strings.ToLower(f.Name)
+			if strings.HasPrefix(n, ".") || strings.Contains(n, "lecture") {
+				continue
+			}
+			// skip archive.org derived low-bitrate copies (track_64kb.mp3)
+			if kbRe.MatchString(n) {
+				continue
+			}
+			if strings.EqualFold(extOf(f.Name), tier) {
+				chosen = append(chosen, f)
+			}
+		}
+		if len(chosen) > 0 {
+			return chosen
+		}
+	}
+	return nil
+}
+
+var kbRe = regexp.MustCompile(`_\d+kb\.`)
+
+// archiveDownloadURL builds the canonical file URL (https://archive.org/
+// download/<id>/<name>, subdirs preserved, path-escaped).
+func archiveDownloadURL(id, name string) string {
+	u := url.URL{Scheme: "https", Host: "archive.org", Path: "/download/" + id + "/" + name}
+	return u.String()
+}
+
+// processArchiveAudio: fetch the item's audio files natively. The primary
+// (preferred format tier, first track) is recorded on the video row; the rest of
+// the tier's tracks go to the media_files table. All fetches use fetchResume
+// (Range-resume, .part -> rename), idempotent across crash-restarts.
+func (p *Pool) processArchiveAudio(v model.Video, src model.Source, cfg sites.Site) error {
+	dial := cfg.Dial
+	if dial == "" && sites.ProxyURL(cfg) != "" {
+		dial = "proxy"
+	}
+	client := netx.Client(dial, sites.ProxyURL(cfg), 0) // no total timeout: large files
+	meta, err := archiveMetadata(client, v.VideoID)
+	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "metadata: "+err.Error())
+		return fmt.Errorf("archive metadata: %w", err)
+	}
+	files := pickAudioFiles(meta.Files)
+	if len(files) == 0 {
+		p.store.MarkSkipped(v.SourceID, v.VideoID, "no audio files (flac/mp3/ogg)")
+		return errSkipped
+	}
+	dir := filepath.Join(p.outDir, "archive-audio")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "mkdir: "+err.Error())
+		return err
+	}
+	title := v.Title
+	if title == "" {
+		title = v.VideoID
+	}
+	// primary file (best tier, first track)
+	primary := files[0]
+	dest := filepath.Join(dir, v.VideoID+"_"+sanitize(title)+"."+strings.ToLower(extOf(primary.Name)))
+	if _, err := os.Stat(dest); err != nil {
+		if err := fetchResume(client, archiveDownloadURL(v.VideoID, primary.Name), dest+".part", dest); err != nil {
+			p.store.MarkFailed(v.SourceID, v.VideoID, "fetch: "+err.Error())
+			return fmt.Errorf("fetch %s: %w", primary.Name, err)
+		}
+	}
+	hash, err := fileSHA256(dest)
+	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "hash: "+err.Error())
+		return err
+	}
+	upd := model.Video{SourceID: v.SourceID, VideoID: v.VideoID, Title: title,
+		Duration: v.Duration, Published: v.Published, Channel: v.Channel,
+		SizeBytes: fileSize(dest), Path: dest, SHA256: hash}
+	if err := p.store.MarkDownloaded(upd); err != nil {
+		return err
+	}
+	// extra tracks of the same tier: media_files table. A failed extra is
+	// logged and skipped (the primary is already recorded done); the row
+	// stays out of media_files until a later pass re-records it.
+	var extras []model.MediaFile
+	for _, f := range files[1:] {
+		ep := filepath.Join(dir, v.VideoID+"_"+sanitize(f.Name))
+		if _, err := os.Stat(ep); err != nil {
+			if err := fetchResume(client, archiveDownloadURL(v.VideoID, f.Name), ep+".part", ep); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN %s extra %s: %v\n", v.VideoID, f.Name, err)
+				continue
+			}
+		}
+		h, herr := fileSHA256(ep)
+		if herr != nil {
+			fmt.Fprintf(os.Stderr, "WARN %s extra %s: %v\n", v.VideoID, f.Name, herr)
+			continue
+		}
+		extras = append(extras, model.MediaFile{
+			SourceID: v.SourceID, VideoID: v.VideoID,
+			URL: archiveDownloadURL(v.VideoID, f.Name),
+			Path: ep, SHA256: h, SizeBytes: fileSize(ep),
+			Ext: strings.ToLower(extOf(f.Name)),
+		})
+	}
+	if len(extras) > 0 {
+		if err := p.store.UpsertMediaFiles(v.SourceID, v.VideoID, extras); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processGallica: download one ark's PDF score through the altcha PoW +
+// cookie flow (see enum/gallica.go), sha256, record on the video row.
+func (p *Pool) processGallica(v model.Video, src model.Source, cfg sites.Site) error {
+	dir := filepath.Join(p.outDir, "gallica")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "mkdir: "+err.Error())
+		return err
+	}
+	title := v.Title
+	if title == "" {
+		title = v.VideoID
+	}
+	dest := filepath.Join(dir, v.VideoID+"_"+sanitize(title)+".pdf")
+	lock := destLock(dest)
+	lock.Lock()
+	defer lock.Unlock()
+	// An existing dest is only trusted when it is a real, nonempty PDF
+	// (a pre-.part-era partial file must be re-downloaded).
+	fi, statErr := os.Stat(dest)
+	if statErr != nil || fi.Size() == 0 || !enum.FileIsPDF(dest) {
+		cl := p.gallicaClient(cfg)
+		if err := cl.Download(context.Background(), v.VideoID, dest); err != nil {
+			p.store.MarkFailed(v.SourceID, v.VideoID, "gallica: "+err.Error())
+			return fmt.Errorf("gallica: %w", err)
+		}
+	}
+	hash, err := fileSHA256(dest)
+	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "hash: "+err.Error())
+		return err
+	}
+	upd := model.Video{SourceID: v.SourceID, VideoID: v.VideoID, Title: title,
+		Duration: 0, Published: v.Published, Channel: v.Channel,
+		SizeBytes: fileSize(dest), Path: dest, SHA256: hash}
+	return p.store.MarkDownloaded(upd)
+}
+
+// gallicaClient: one Gallica session per pool (the altcha PoW is solved once
+// per session — a fresh client per video would pay the full solve each time).
+func (p *Pool) gallicaClient(cfg sites.Site) *enum.Gallica {
+	p.gallicaMu.Lock()
+	defer p.gallicaMu.Unlock()
+	if p.gallica == nil {
+		p.gallica = enum.NewGallica(cfg)
+	}
+	return p.gallica
+}
+
+// destLock: per-destination mutex so two workers (duplicate rows, overlapping
+// sources) never write the same file concurrently.
+var destLocks sync.Map
+
+func destLock(dest string) *sync.Mutex {
+	v, _ := destLocks.LoadOrStore(dest, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // fetchResume downloads url to tmp with Range resume, retrying on

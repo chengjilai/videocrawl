@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -113,7 +114,7 @@ func TestNextForDownloadOrdering(t *testing.T) {
 	setVideoState(t, s, 1, "fmaxatt", model.StatusNew, 5)
 	setVideoState(t, s, 1, "gmaxfail", model.StatusFailed, 5)
 
-	got, err := s.NextForDownload(10)
+	got, err := s.NextForDownload(10, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,12 +128,12 @@ func TestNextForDownloadOrdering(t *testing.T) {
 		}
 	}
 	// LIMIT is honored
-	if got2, _ := s.NextForDownload(2); len(got2) != 2 || got2[0].VideoID != "efail" || got2[1].VideoID != "b2023" {
+	if got2, _ := s.NextForDownload(2, 0, 0); len(got2) != 2 || got2[0].VideoID != "efail" || got2[1].VideoID != "b2023" {
 		t.Fatalf("limit 2: %v", ids(got2))
 	}
 	// same-date tiebreak falls back to (source_id, video_id) — deterministic
 	insVideo(t, s, v("h2023", "2023-01-01", model.StatusNew, 0))
-	if got3, _ := s.NextForDownload(10); got3[1].VideoID != "b2023" || got3[2].VideoID != "h2023" {
+	if got3, _ := s.NextForDownload(10, 0, 0); got3[1].VideoID != "b2023" || got3[2].VideoID != "h2023" {
 		t.Fatalf("tiebreak: %v", ids(got3))
 	}
 }
@@ -184,7 +185,7 @@ func TestMarkTransitions(t *testing.T) {
 	}
 
 	// a failed video with attempts < 5 stays eligible
-	if got, _ := s.NextForDownload(10); len(got) != 1 || got[0].VideoID != "x" {
+	if got, _ := s.NextForDownload(10, 0, 0); len(got) != 1 || got[0].VideoID != "x" {
 		t.Errorf("failed video (attempts=3) not re-queued: %v", ids(got))
 	}
 	// after enough failures the attempts<5 filter kicks in
@@ -194,7 +195,7 @@ func TestMarkTransitions(t *testing.T) {
 	if err := s.MarkFailed(7, "x", "again"); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.NextForDownload(10); len(got) != 0 {
+	if got, _ := s.NextForDownload(10, 0, 0); len(got) != 0 {
 		t.Errorf("attempts>=5 video re-queued: %v", ids(got))
 	}
 }
@@ -216,6 +217,109 @@ func TestUpdateMeta(t *testing.T) {
 	}
 	if rows, _ := s.VideoRows("", 10); len(rows) != 1 {
 		t.Errorf("UpdateMeta created a row: %d", len(rows))
+	}
+}
+
+// TestNextForUpload: only done videos, oldest published first, undated
+// last, limit honored; uploaded videos never reappear.
+func TestNextForUpload(t *testing.T) {
+	s := newTestStore(t)
+	v := func(id, published, status string) model.Video {
+		return model.Video{SourceID: 1, VideoID: id, URL: "u/" + id, Published: published, Status: status}
+	}
+	insVideo(t, s, v("a2024", "2024-01-01", model.StatusNew))
+	insVideo(t, s, v("b2023", "2023-01-01", model.StatusNew))
+	insVideo(t, s, v("ddone", "2022-01-01", model.StatusNew))
+	insVideo(t, s, v("eundated", "", model.StatusNew))
+	insVideo(t, s, v("fnew", "2020-01-01", model.StatusNew))
+	setVideoState(t, s, 1, "ddone", model.StatusDone, 0)
+	setVideoState(t, s, 1, "eundated", model.StatusDone, 0)
+	setVideoState(t, s, 1, "b2023", model.StatusDone, 0)
+	setVideoState(t, s, 1, "a2024", model.StatusDone, 0)
+
+	got, err := s.NextForUpload(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ddone", "b2023", "a2024", "eundated"} // new excluded
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, ids(got))
+	}
+	for i, w := range want {
+		if got[i].VideoID != w {
+			t.Fatalf("order[%d] = %s, want %s (all: %v)", i, got[i].VideoID, w, ids(got))
+		}
+	}
+	if got2, _ := s.NextForUpload(2); len(got2) != 2 || got2[0].VideoID != "ddone" || got2[1].VideoID != "b2023" {
+		t.Fatalf("limit 2: %v", ids(got2))
+	}
+}
+
+// TestUploadMarked: sets status=uploaded + bvid; the video leaves both the
+// upload queue and the download queue.
+func TestUploadMarked(t *testing.T) {
+	s := newTestStore(t)
+	insVideo(t, s, model.Video{SourceID: 1, VideoID: "v1", URL: "u/v1"})
+	setVideoState(t, s, 1, "v1", model.StatusDone, 0)
+	if err := s.UploadMarked(1, "v1", "BV1xx411c7mD"); err != nil {
+		t.Fatal(err)
+	}
+	v := getOne(t, s, 1, "v1")
+	if v.Status != model.StatusUploaded || v.BVID != "BV1xx411c7mD" {
+		t.Errorf("after UploadMarked: status=%q bvid=%q", v.Status, v.BVID)
+	}
+	if got, _ := s.NextForUpload(10); len(got) != 0 {
+		t.Errorf("uploaded video still in upload queue: %v", ids(got))
+	}
+	if got, _ := s.NextForDownload(10, 0, 0); len(got) != 0 {
+		t.Errorf("uploaded video in download queue: %v", ids(got))
+	}
+}
+
+// TestBvidMigration: an old-schema DB (videos without the bvid column) is
+// migrated on Open so upload tracking works.
+func TestBvidMigration(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "old.db")
+	// build a pre-bvid videos table by hand (the original schema)
+	db, err := sql.Open("sqlite", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE videos (
+		source_id INTEGER NOT NULL,
+		video_id TEXT NOT NULL,
+		url TEXT NOT NULL,
+		title TEXT NOT NULL DEFAULT '',
+		duration INTEGER NOT NULL DEFAULT 0,
+		published TEXT NOT NULL DEFAULT '',
+		channel TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'new',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		size_bytes INTEGER NOT NULL DEFAULT 0,
+		path TEXT NOT NULL DEFAULT '',
+		sha256 TEXT NOT NULL DEFAULT '',
+		fetched_at TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (source_id, video_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO videos (source_id,video_id,url,status) VALUES (1,'old','u/old','done')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(p) // must migrate
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UploadMarked(1, "old", "BV1old123456"); err != nil {
+		t.Fatal(err)
+	}
+	v := getOne(t, s, 1, "old")
+	if v.Status != model.StatusUploaded || v.BVID != "BV1old123456" {
+		t.Errorf("migrated DB: status=%q bvid=%q", v.Status, v.BVID)
 	}
 }
 

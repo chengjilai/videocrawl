@@ -12,6 +12,8 @@ const (
 	KindCCCConf         = "ccc-conf"         // media.ccc.de conference acronym
 	KindCCCSearch       = "ccc-search"       // media.ccc.de event search
 	KindArchiveQuery    = "archive-query"    // archive.org lucene query
+	KindArchiveAudio    = "archive-audio"    // archive.org mediatype:audio query (native downloads)
+	KindGallica         = "gallica"          // BnF Gallica ark PDF score (native download)
 	KindRSS             = "rss"              // feed URL with video enclosures
 )
 
@@ -40,21 +42,23 @@ type Video struct {
 	Duration  int64  // seconds, 0 = unknown
 	Published string // ISO date
 	Channel   string
-	Status    string // new|done|skipped|failed
+	Status    string // new|done|skipped|failed|uploaded
 	Attempts  int
 	LastError string
 	SizeBytes int64
 	Path      string
 	SHA256    string
+	BVID      string // bilibili video id after upload
 	FetchedAt string
 }
 
 // Statuses.
 const (
-	StatusNew     = "new"
-	StatusDone    = "done"
-	StatusSkipped = "skipped"
-	StatusFailed  = "failed"
+	StatusNew      = "new"
+	StatusDone     = "done"
+	StatusSkipped  = "skipped"
+	StatusFailed   = "failed"
+	StatusUploaded = "uploaded"
 )
 
 // File: one downloadable media/subtitle file.
@@ -63,4 +67,17 @@ type File struct {
 	Size int64
 	Ext  string // mp4|webm|srt|vtt
 	Kind string // video|sub
+}
+
+// MediaFile: an additional file recorded alongside a downloaded video
+// (archive-audio items: extra tracks beyond the primary; e.g. the rest of
+// an album in the chosen format tier).
+type MediaFile struct {
+	SourceID  int64
+	VideoID   string
+	URL       string
+	Path      string
+	SHA256    string
+	SizeBytes int64
+	Ext       string
 }

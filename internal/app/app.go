@@ -2,14 +2,19 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,16 +30,22 @@ import (
 )
 
 type App struct {
-	DBPath  string
-	OutDir  string
-	SitesJS string
+	DBPath       string
+	OutDir       string
+	SitesJS      string
+	UploadScript string // bilibili uploader CLI (upload_web.py)
 }
 
 func Default() *App {
 	home, _ := os.UserHomeDir()
 	db := envOr("VIDEOCRAWL_DB", home+"/videocrawl.db")
 	out := envOr("VIDEOCRAWL_OUT", home+"/Videos/Crawl")
-	return &App{DBPath: db, OutDir: out, SitesJS: envOr("VIDEOCRAWL_SITES_JSON", "")}
+	return &App{
+		DBPath:       db,
+		OutDir:       out,
+		SitesJS:      envOr("VIDEOCRAWL_SITES_JSON", ""),
+		UploadScript: envOr("VIDEOCRAWL_UPLOAD_SCRIPT", filepath.Join(home, "src", "bilibili", "upload_web.py")),
+	}
 }
 
 func envOr(k, d string) string {
@@ -144,6 +155,33 @@ func normalize(kind, raw, query string) (string, string, error) {
 			return "", "", fmt.Errorf("archive-query needs --query (lucene), e.g. 'mediatype:movies AND collection:tech_talks'")
 		}
 		return "https://archive.org/advancedsearch.php", query, nil
+	case model.KindArchiveAudio:
+		// seed: a bare lucene query, a --query, or an archive.org/details URL
+		// (single item). mediatype:audio is guaranteed in the query so the
+		// archive enumerator only ever sees audio items.
+		q := strings.TrimSpace(query)
+		if q == "" {
+			q = raw
+		}
+		if i := strings.Index(q, "archive.org/details/"); i >= 0 {
+			q = "identifier:" + strings.SplitN(q[i+len("archive.org/details/"):], "/", 2)[0]
+		} else if strings.HasPrefix(q, "http") {
+			return "", "", fmt.Errorf("archive-audio needs a lucene query or an archive.org/details URL, got %q", raw)
+		}
+		q = strings.TrimSpace(q)
+		if q == "" {
+			return "", "", fmt.Errorf("archive-audio needs a lucene query (bare or --query)")
+		}
+		if !strings.Contains(q, "mediatype:audio") {
+			q += " AND mediatype:audio"
+		}
+		return "https://archive.org/advancedsearch.php", q, nil
+	case model.KindGallica:
+		ark := enum.GallicaArk(raw)
+		if ark == "" {
+			return "", "", fmt.Errorf("gallica needs an ark URL: https://gallica.bnf.fr/ark:/12148/<ark>")
+		}
+		return "https://gallica.bnf.fr/ark:/12148/" + ark, "", nil
 	case model.KindRSS:
 		if !strings.HasPrefix(raw, "http") {
 			return "", "", fmt.Errorf("rss needs a feed URL")
@@ -424,6 +462,284 @@ func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds i
 	}
 }
 
+// ---- upload ----
+
+// uploadGate decides which sources may be republished to bilibili.
+type uploadGate struct {
+	ids   map[int64]bool
+	sites map[string]bool
+}
+
+func (g *uploadGate) allows(src model.Source) bool {
+	return g.ids[src.ID] || g.sites[src.Site]
+}
+
+// parseUploadAllowlist parses --upload-allowlist: the token 'cc' (CC BY
+// verified: media.ccc.de, site 'ccc') and/or a comma list of numeric source
+// ids. An empty spec refuses everything (licensing discipline: no accidental
+// republishing of videos we have no right to mirror).
+func parseUploadAllowlist(spec string) (*uploadGate, error) {
+	g := &uploadGate{ids: map[int64]bool{}, sites: map[string]bool{}}
+	for _, tok := range strings.Split(spec, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if tok == "cc" {
+			g.sites["ccc"] = true
+			continue
+		}
+		id, err := strconv.ParseInt(tok, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("--upload-allowlist: unknown token %q (want 'cc' or source ids)", tok)
+		}
+		g.ids[id] = true
+	}
+	if len(g.ids) == 0 && len(g.sites) == 0 {
+		return nil, fmt.Errorf("upload refused: --upload-allowlist required (licensing discipline); pass 'cc' for CC BY (site=ccc) sources or a comma list of source ids")
+	}
+	return g, nil
+}
+
+// Upload publishes done videos to bilibili through the web-path uploader
+// (upload_web.py). outDir is the local crawl root (VIDEOCRAWL_OUT); the
+// recorded videos.path may live on another machine (lab→aturing sync), so
+// --path-prefix-rewrite OLD:NEW maps it to the local tree, and a final
+// id-prefix scan of outDir catches stragglers. Failures are logged to
+// stderr and the video stays 'done' (retryable next pass); only a parsed
+// "SUBMIT OK" bvid moves the row to 'uploaded'.
+func (a *App) Upload(limit int, dryRun bool, allowlist, pathPrefixRewrite, outDir string) error {
+	gate, err := parseUploadAllowlist(allowlist)
+	if err != nil {
+		return err
+	}
+	st, err := a.open()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if limit <= 0 {
+		limit = 1 << 30
+	}
+	rows, err := st.NextForUpload(limit)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		// apply the SAME licensing gate as the real loop (dry-run must not
+		// promise uploads a real run would refuse)
+		ok := 0
+		skip := 0
+		for _, v := range rows {
+			src, err := st.GetSource(v.SourceID)
+			if err != nil || !gate.allows(src) {
+				skip++
+				continue
+			}
+			ok++
+			p, _ := rewritePath(v.Path, pathPrefixRewrite)
+			fmt.Printf("  %-6s %-12s %-40s %s\n", fmt.Sprintf("#%d", v.SourceID), trunc(v.VideoID, 12), trunc(v.Title, 40), p)
+		}
+		fmt.Printf("upload: dry-run — would upload %d video(s), %d skipped (allowlist)\n", ok, skip)
+		return nil
+	}
+	if len(rows) == 0 {
+		fmt.Println("upload: nothing to upload (no done videos)")
+		return nil
+	}
+	ok, fail, skip := 0, 0, 0
+	for _, v := range rows {
+		src, err := st.GetSource(v.SourceID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "upload: FAIL %s (%s): source #%d: %v\n", v.VideoID, v.URL, v.SourceID, err)
+			fail++
+			continue
+		}
+		if !gate.allows(src) {
+			fmt.Fprintf(os.Stderr, "upload: SKIP %s (%s): source #%d site=%s not in allowlist\n", v.VideoID, v.URL, src.ID, src.Site)
+			skip++
+			continue
+		}
+		if err := a.uploadOne(st, v, src, pathPrefixRewrite, outDir); err != nil {
+			fmt.Fprintf(os.Stderr, "upload: FAIL %s (%s): %v\n", v.VideoID, v.URL, err)
+			fail++
+			continue
+		}
+		ok++
+	}
+	fmt.Printf("upload pass done: %d ok, %d failed, %d skipped (allowlist)\n", ok, fail, skip)
+	return nil
+}
+
+// uploadOne shells to upload_web.py for one video and records the bvid.
+func (a *App) uploadOne(st *store.Store, v model.Video, src model.Source, pathPrefixRewrite, outDir string) error {
+	path, err := findUploadFile(v.Path, v.VideoID, outDir, pathPrefixRewrite)
+	if err != nil {
+		return err
+	}
+	if v.URL == "" {
+		return fmt.Errorf("no source URL in DB")
+	}
+	if v.Title == "" {
+		return fmt.Errorf("no title in DB")
+	}
+	title := uploadTitle(v.Title)
+	desc := uploadDesc(v, subFileNextTo(path, v.VideoID))
+	script := a.UploadScript
+	if script == "" {
+		home, _ := os.UserHomeDir()
+		script = filepath.Join(home, "src", "bilibili", "upload_web.py")
+	}
+	if _, err := os.Stat(script); err != nil {
+		return fmt.Errorf("uploader script %s: %v", script, err)
+	}
+	fmt.Printf("upload: %s -> bilibili (%s)\n", v.VideoID, path)
+	cmd := exec.Command("python3", script, path,
+		"--title", title, "--source", v.URL, "--tag", "科技", "--desc", desc)
+	var out bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &out) // progress + SUBMIT OK line
+	cmd.Stderr = os.Stderr                       // uploader failures land on stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("uploader: %v", err)
+	}
+	bvid := parseBVID(out.String())
+	if bvid == "" {
+		return fmt.Errorf("uploader exited 0 but printed no 'SUBMIT OK — https://www.bilibili.com/video/<bvid>'")
+	}
+	if err := st.UploadMarked(v.SourceID, v.VideoID, bvid); err != nil {
+		return err
+	}
+	fmt.Printf("upload: %s -> https://www.bilibili.com/video/%s\n", v.VideoID, bvid)
+	return nil
+}
+
+// uploadDesc builds the repost description; the final line is only added
+// when an English-subtitle file was actually downloaded next to the video
+// (yt-dlp --write-auto-subs en.* / ccc .srt/.vtt), so we never claim subs
+// we are not sure about.
+func uploadDesc(v model.Video, hasSubs bool) string {
+	d := "转载自: " + v.URL + "\n演讲者: " + v.Channel + "\n版权归原作者与主办方所有, 本视频为转载"
+	if hasSubs {
+		d += "\n(含英文字幕)"
+	}
+	return d
+}
+
+// uploadTitle truncates to 80 runes (the uploader hard-fails above 80).
+func uploadTitle(s string) string {
+	r := []rune(s)
+	if len(r) <= 80 {
+		return s
+	}
+	return string(r[:79]) + "…"
+}
+
+// subFileNextTo reports whether a subtitle file (srt/vtt/ass/sub) with the
+// video's id prefix sits next to the video file.
+func subFileNextTo(videoPath, videoID string) bool {
+	entries, err := os.ReadDir(filepath.Dir(videoPath))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, videoID+"_") {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".srt", ".vtt", ".ass", ".sub":
+			return true
+		}
+	}
+	return false
+}
+
+// findUploadFile resolves the local file for one video: the recorded path
+// (after --path-prefix-rewrite), the raw recorded path, then a one-level
+// scan of outDir for the id-prefixed file (lab→aturing sync stragglers).
+func findUploadFile(path, videoID, outDir, rewrite string) (string, error) {
+	candidates := []string{}
+	if p, ok := rewritePath(path, rewrite); ok {
+		candidates = append(candidates, p)
+	}
+	if path != "" {
+		candidates = append(candidates, path)
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			return c, nil
+		}
+	}
+	if outDir != "" {
+		if p := scanOutDir(outDir, videoID); p != "" {
+			return p, nil
+		}
+	}
+	if path != "" {
+		return "", fmt.Errorf("file not found: %s", path)
+	}
+	return "", fmt.Errorf("no local file for %s (path empty)", videoID)
+}
+
+// scanOutDir looks one level deep (outDir/<channel>/<file>, the yt-dlp
+// output template) for a finished video file with the id prefix.
+func scanOutDir(outDir, videoID string) string {
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return ""
+	}
+	for _, dir := range entries {
+		if !dir.IsDir() {
+			continue
+		}
+		sub, err := os.ReadDir(filepath.Join(outDir, dir.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range sub {
+			if f.IsDir() || !strings.HasPrefix(f.Name(), videoID+"_") {
+				continue
+			}
+			switch filepath.Ext(f.Name()) {
+			case ".mp4", ".mkv", ".webm", ".flv":
+				return filepath.Join(outDir, dir.Name(), f.Name())
+			}
+		}
+	}
+	return ""
+}
+
+// rewritePath applies the OLD:NEW prefix rewrite: when p starts with OLD,
+// returns (NEW + remainder, true); otherwise (p, false).
+func rewritePath(p, spec string) (string, bool) {
+	if spec == "" {
+		return p, false
+	}
+	old, newp, ok := strings.Cut(spec, ":")
+	if !ok || old == "" {
+		return p, false
+	}
+	if !strings.HasPrefix(p, old) {
+		return p, false
+	}
+	return newp + strings.TrimPrefix(p, old), true
+}
+
+// parseBVID extracts the bvid from the uploader's "SUBMIT OK —
+// https://www.bilibili.com/video/<bvid>" line (em dash tolerant).
+var submitOKRe = regexp.MustCompile(`SUBMIT OK.*https://www\.bilibili\.com/video/(BV[0-9A-Za-z]+)`)
+
+func parseBVID(s string) string {
+	m := submitOKRe.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 // ---- status / list ----
 
 func (a *App) Status() error {
@@ -478,8 +794,9 @@ func (a *App) List(status string, jsonOut bool, limit int) error {
 		return nil
 	}
 	for _, v := range rows {
-		fmt.Printf("%-12s %-30s %8ds %-20s %s\n",
-			v.Status, trunc(v.Title, 30), v.Duration, trunc(v.Channel, 20), v.URL)
+		fmt.Printf("%-12s %-30s %8ds %-20s %10d %s %s\n",
+			v.Status, trunc(v.Title, 30), v.Duration, trunc(v.Channel, 20),
+			v.SizeBytes, v.SHA256, v.URL)
 	}
 	return nil
 }
