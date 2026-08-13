@@ -37,6 +37,7 @@ func EnumCmd(extra []string, cookies, proxy string) *exec.Cmd {
 	args := []string{
 		"--flat-playlist", "-j", "--no-warnings",
 		"--sleep-requests", "1",
+		"--socket-timeout", "60",
 	}
 	if cookies != "" {
 		args = append(args, "--cookies", cookies)
@@ -120,6 +121,7 @@ type MetaEntry struct {
 	Channel     string `json:"channel"`
 	UploadDate  string `json:"upload_date"`
 	LiveStatus  string `json:"live_status"`
+	MediaType   string `json:"media_type"` // "short" for YouTube Shorts (verified: yt-dlp sets it from isShortsEligible)
 	URL         string `json:"webpage_url"`
 	Description string `json:"description"`
 }
@@ -156,6 +158,7 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, extra []string, u
 	args := []string{
 		"--no-playlist",
 		"-w", "--continue", "--no-overwrites",
+		"--sleep-requests", "1", // politeness: the app limiter does not cover downloads
 		"-o", "%(channel)s/%(id)s_%(title).100B.%(ext)s",
 		"--restrict-filenames",
 		"-P", "temp:" + outDir + "/.tmp",
@@ -166,6 +169,7 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, extra []string, u
 		"--retry-sleep", "fragment:exp=1:10",
 		"--retry-sleep", "http:linear=1:10",
 		"--no-warnings",
+		"--socket-timeout", "60", // a hung socket must not stall the round forever
 	}
 	if maxHeight > 0 {
 		f := fmt.Sprintf("bv*[height<=%d]+ba/b", maxHeight)

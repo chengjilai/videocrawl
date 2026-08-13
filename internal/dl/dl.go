@@ -5,6 +5,7 @@
 package dl
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,15 +38,15 @@ type Policy struct {
 
 // Pool runs W workers.
 type Pool struct {
-	store *store.Store
-	sites map[string]sites.Site
-	outDir string
-	policy Policy
+	store   *store.Store
+	sites   map[string]sites.Site
+	outDir  string
+	policy  Policy
 	workers int
-	mu   sync.Mutex
-	done int
-	fail int
-	skip int
+	mu      sync.Mutex
+	done    int
+	fail    int
+	skip    int
 }
 
 func NewPool(st *store.Store, sites map[string]sites.Site, outDir string, policy Policy, workers int) *Pool {
@@ -57,8 +59,20 @@ func (p *Pool) Counts() (done, fail, skip int) {
 	return p.done, p.fail, p.skip
 }
 
-// Run processes videos until the queue is empty or limit is reached.
-func (p *Pool) Run(limit int) error {
+// Expired reports whether a cooperative pass should stop: the context was
+// canceled (SIGINT/SIGTERM) or the per-round deadline passed. Checked
+// between videos/sources, never mid-download — the current item finishes
+// (crash-safe .part resume handles the rest).
+func Expired(ctx context.Context, deadline time.Time) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return !deadline.IsZero() && time.Now().After(deadline)
+}
+
+// Run processes videos until the queue is empty, limit is reached, or the
+// pass budget/signal fires (cooperative: in-flight videos finish first).
+func (p *Pool) Run(ctx context.Context, limit int, deadline time.Time) error {
 	if limit <= 0 {
 		limit = 1 << 30
 	}
@@ -66,6 +80,10 @@ func (p *Pool) Run(limit int) error {
 	// (single conn), so pull small batches and track done via status.
 	totalDone := 0
 	for totalDone < limit {
+		if Expired(ctx, deadline) {
+			fmt.Fprintf(os.Stderr, "download: pass stopped early (time budget/signal)\n")
+			return nil
+		}
 		batch, err := p.store.NextForDownload(p.workers * 2)
 		if err != nil {
 			return err
@@ -75,10 +93,17 @@ func (p *Pool) Run(limit int) error {
 		}
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, p.workers)
+		remaining := limit - totalDone
+		launched := 0
 		for _, v := range batch {
-			if totalDone >= limit {
+			if launched >= remaining {
 				break
 			}
+			if Expired(ctx, deadline) {
+				fmt.Fprintf(os.Stderr, "download: stopping early (time budget/signal); finishing in-flight videos\n")
+				break
+			}
+			launched++
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(v model.Video) {
@@ -103,7 +128,7 @@ func (p *Pool) Run(limit int) error {
 			}(v)
 		}
 		wg.Wait()
-		totalDone += len(batch)
+		totalDone += launched
 		if len(batch) < p.workers*2 {
 			return nil
 		}
@@ -116,6 +141,7 @@ var errSkipped = errors.New("skipped")
 func (p *Pool) process(v model.Video) error {
 	src, err := p.store.GetSource(v.SourceID)
 	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "source: "+err.Error())
 		return fmt.Errorf("source: %w", err)
 	}
 	cfg := p.sites[src.Site]
@@ -151,6 +177,14 @@ func (p *Pool) process(v model.Video) error {
 	}
 	if p.policy.SkipLive && meta.LiveStatus != "" && meta.LiveStatus != "not_live" {
 		p.store.MarkSkipped(v.SourceID, v.VideoID, "live: "+meta.LiveStatus)
+		return errSkipped
+	}
+	// SkipShorts: yt-dlp full metadata sets media_type="short" (from
+	// isShortsEligible), so this is reliable even though flat entries lack
+	// duration. The min-dur policy alone cannot catch Shorts (up to 3 min,
+	// and unknown durations pass `dur > 0`).
+	if p.policy.SkipShorts && meta.MediaType == "short" {
+		p.store.MarkSkipped(v.SourceID, v.VideoID, "youtube short")
 		return errSkipped
 	}
 
@@ -199,6 +233,8 @@ func findOutput(outDir, videoID string) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	var best string
+	var bestMtime time.Time
 	for _, dir := range entries {
 		if !dir.IsDir() {
 			continue
@@ -212,16 +248,31 @@ func findOutput(outDir, videoID string) (string, int64, error) {
 				continue
 			}
 			base := f.Name()
-			if strings.HasPrefix(base, videoID+"_") && !strings.HasSuffix(base, ".part") {
-				info, err := f.Info()
-				if err != nil {
-					continue
-				}
-				return filepath.Join(outDir, dir.Name(), base), info.Size(), nil
+			if !strings.HasPrefix(base, videoID+"_") {
+				continue
+			}
+			if strings.Contains(base, ".part") {
+				continue // temp or fragment files
+			}
+			ext := filepath.Ext(base)
+			if ext != ".mp4" && ext != ".mkv" && ext != ".webm" && ext != ".flv" && ext != ".m4a" {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(bestMtime) {
+				bestMtime = info.ModTime()
+				best = filepath.Join(outDir, dir.Name(), base)
 			}
 		}
 	}
-	return "", 0, fmt.Errorf("no output file for %s", videoID)
+	if best == "" {
+		return "", 0, fmt.Errorf("no output file for %s", videoID)
+	}
+	info, _ := os.Stat(best)
+	return best, info.Size(), nil
 }
 
 func fileSHA256(path string) (string, error) {
@@ -238,11 +289,13 @@ func fileSHA256(path string) (string, error) {
 }
 
 // processNative: static-file download (media.ccc.de): pick the best video
-// recording + en subtitles recorded at enumeration time, fetch with Range
-// resume through the warp-doh transport, .part -> atomic rename, sha256.
+// recording + en subtitles recorded at enumeration time, fetch through the
+// warp-doh transport with parallel Range stripes (see fetchStriped), .part
+// -> atomic rename, sha256.
 func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) error {
 	files, err := p.store.GetFiles(v.SourceID, v.VideoID)
 	if err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "files: "+err.Error())
 		return fmt.Errorf("files: %w", err)
 	}
 	if len(files) == 0 && src.Site == "ccc" {
@@ -282,6 +335,7 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	}
 	dir := filepath.Join(p.outDir, channel)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		p.store.MarkFailed(v.SourceID, v.VideoID, "mkdir: "+err.Error())
 		return err
 	}
 	ext := videoFile.Ext
@@ -301,7 +355,7 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 			SizeBytes: info.Size(), Path: base, SHA256: hash}
 		return p.store.MarkDownloaded(upd)
 	}
-	if err := fetchResume(client, videoFile.URL, base+".part", base); err != nil {
+	if err := fetchStriped(client, videoFile.URL, base+".part", base); err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "fetch: "+err.Error())
 		return fmt.Errorf("fetch %s: %w", videoFile.URL, err)
 	}
@@ -328,7 +382,9 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 // fetchResume downloads url to tmp with Range resume, retrying on
 // connection drops (WARP egress is flaky on long transfers — verified:
 // mid-stream EOF). Each attempt continues from tmp's current size; on
-// success the tmp file is renamed to dst (atomic).
+// success the tmp file is renamed to dst (atomic). Still used for
+// subtitles (small) and as the single-stream fallback in fetchStriped
+// (no-range servers, small files, probe failures).
 func fetchResume(client *http.Client, url, tmp, dst string) error {
 	const maxAttempts = 8
 	var lastErr error
@@ -376,6 +432,287 @@ func fetchOnce(client *http.Client, url, tmp string) error {
 	}
 	f.Sync()
 	return nil
+}
+
+// ---- parallel range-fetch stripes ----
+//
+// A single WARP stream tops out around 130KB/s (verified), so one
+// Range-resume connection per file is the throughput bottleneck. Instead we
+// split each file into N disjoint byte ranges fetched concurrently
+// (aria2-style), each stripe on its own WARP connection + socks hop, and
+// assemble them by WriteAt into a sparse-preallocated .part file. Each
+// stripe retries from its own progress on connection drops (the verified
+// WARP mid-stream EOF). Politeness: the ccc mirror is volunteer-run, so
+// stripes are capped at 6 (default 4) and a token bucket shared by all
+// stripes caps each file's aggregate rate (default 4 MiB/s).
+
+const (
+	nativeStripesDefault = 4
+	nativeStripesMax     = 6
+	nativeRateCeilBytes  = 4 << 20 // per-file ceiling, bytes/s
+	nativeSmallFile      = 8 << 20 // below this: single stream is enough
+)
+
+// nativeConfig resolves the per-file download tuning from the environment
+// (VIDEOCRAWL_STRIPES, VIDEOCRAWL_RATE_CEIL_MB).
+func nativeConfig() (stripes int, rateCeil int64) {
+	stripes = nativeStripesDefault
+	if v := os.Getenv("VIDEOCRAWL_STRIPES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			if n > nativeStripesMax {
+				n = nativeStripesMax
+			}
+			stripes = n
+		}
+	}
+	rateCeil = nativeRateCeilBytes
+	if v := os.Getenv("VIDEOCRAWL_RATE_CEIL_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			rateCeil = int64(n) << 20
+		}
+	}
+	return stripes, rateCeil
+}
+
+// fetchStriped downloads url to tmp with N parallel Range GETs and renames
+// to dst on success. Falls back to the single-stream fetchResume when the
+// server lacks range support, the file is small, or the probe fails.
+func fetchStriped(client *http.Client, url, tmp, dst string) error {
+	total, ranges, err := probeRange(client, url)
+	if err != nil || !ranges || total < nativeSmallFile {
+		return fetchResume(client, url, tmp, dst)
+	}
+	stripes, rateCeil := nativeConfig()
+	// never split into stripes smaller than ~1MiB
+	if stripes > 1 && total/int64(stripes) < 1<<20 {
+		stripes = int(total / (1 << 20))
+		if stripes < 1 {
+			stripes = 1
+		}
+	}
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// sparse-preallocate: holes read as zeros; stripes WriteAt disjoint
+	// regions (concurrent WriteAt is safe; pwrite, no shared offset). Note:
+	// striped progress is not persisted, so a restarted .part is fetched
+	// from scratch (single-stream resume is kept for subs/fallback).
+	if err := f.Truncate(total); err != nil {
+		return err
+	}
+	lim := newByteLimiter(rateCeil)
+	errc := make(chan error, stripes)
+	var wg sync.WaitGroup
+	var writtenMu sync.Mutex
+	var writtenTotal int64
+	for i := 0; i < stripes; i++ {
+		start := total * int64(i) / int64(stripes)
+		end := total * int64(i+1) / int64(stripes)
+		if i == stripes-1 {
+			end = total
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(start, end int64) {
+			defer wg.Done()
+			n, err := fetchStripe(client, url, f, start, end, lim)
+			writtenMu.Lock()
+			writtenTotal += n
+			writtenMu.Unlock()
+			if err != nil {
+				errc <- fmt.Errorf("stripe [%d-%d): %w", start, end, err)
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	close(errc)
+	for e := range errc {
+		return e
+	}
+	if writtenTotal != total {
+		return fmt.Errorf("striped fetch short: wrote %d of %d bytes", writtenTotal, total)
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+// fetchStripe downloads one disjoint [start,end) region of url into f via
+// WriteAt, resuming from stripe-local progress on connection drops.
+func fetchStripe(client *http.Client, url string, f *os.File, start, end int64, lim *byteLimiter) (int64, error) {
+	const maxAttempts = 8
+	var done int64
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		n, err := stripeOnce(client, url, f, start+done, end, lim)
+		done += n
+		if err == nil {
+			return done, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
+	return done, lastErr
+}
+
+// stripeOnce makes one Range GET for [from,end) and writes the body at
+// absolute offsets, returning bytes written. Defensively handles servers
+// that ignore Range (200 full body: discard the prefix) and 416 (range past
+// EOF: nothing left to fetch).
+func stripeOnce(client *http.Client, url string, f *os.File, from, end int64, lim *byteLimiter) (int64, error) {
+	if from >= end {
+		return 0, nil
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "videocrawl/1.0")
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, end-1))
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusPartialContent: // 206: range honored, body starts at from
+	case http.StatusRequestedRangeNotSatisfiable: // 416: stripe already past EOF
+		return 0, nil
+	case http.StatusOK: // server ignored Range: full body from 0
+		if from > 0 {
+			if _, err := io.CopyN(io.Discard, resp.Body, from); err != nil {
+				return 0, err
+			}
+		}
+	default:
+		return 0, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	n, err := copyLimitedAt(f, from, io.LimitReader(resp.Body, end-from), lim)
+	if err != nil {
+		return n, err
+	}
+	if n < end-from {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
+}
+
+// copyLimitedAt copies r into f at absolute offset off (WriteAt: disjoint
+// ranges from concurrent stripes are safe), throttled by the shared limiter.
+func copyLimitedAt(f *os.File, off int64, r io.Reader, lim *byteLimiter) (int64, error) {
+	buf := make([]byte, 128<<10)
+	var written int64
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			lim.wait(n)
+			wn, werr := f.WriteAt(buf[:n], off+written)
+			written += int64(wn)
+			if werr != nil {
+				return written, werr
+			}
+			if wn != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr == io.EOF {
+			return written, nil
+		}
+		if rerr != nil {
+			return written, rerr
+		}
+	}
+}
+
+// probeRange asks the server for byte 0 and its total size. Returns
+// (size, true) when the server honors ranges (206 + Content-Range), or
+// (size, false) for a plain 200 (no range support).
+func probeRange(client *http.Client, url string) (int64, bool, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "videocrawl/1.0")
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // tiny, drain for keep-alive
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		return total, ok, nil
+	case http.StatusOK:
+		return resp.ContentLength, false, nil
+	default:
+		return 0, false, fmt.Errorf("probe: http %d", resp.StatusCode)
+	}
+}
+
+// parseContentRange extracts the total size from "bytes 0-0/<total>".
+func parseContentRange(v string) (int64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	i := strings.LastIndexByte(v, '/')
+	if i < 0 {
+		return 0, false
+	}
+	total := strings.TrimSpace(v[i+1:])
+	if total == "*" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// byteLimiter: token bucket shared by all stripes of one file so the
+// aggregate rate never exceeds the ceiling. nil receiver = unlimited.
+// Errs toward slower under contention (polite direction).
+type byteLimiter struct {
+	mu     sync.Mutex
+	rate   float64 // bytes per second
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newByteLimiter(rate int64) *byteLimiter {
+	if rate <= 0 {
+		return nil
+	}
+	return &byteLimiter{rate: float64(rate), burst: float64(rate) / 4, last: time.Now()}
+}
+
+// wait blocks until n tokens are available.
+func (l *byteLimiter) wait(n int) {
+	if l == nil {
+		return
+	}
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		l.tokens += now.Sub(l.last).Seconds() * l.rate
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		l.last = now
+		if l.tokens >= float64(n) {
+			l.tokens -= float64(n)
+			l.mu.Unlock()
+			return
+		}
+		deficit := float64(n) - l.tokens
+		l.tokens = 0
+		l.mu.Unlock()
+		time.Sleep(time.Duration(deficit / l.rate * float64(time.Second)))
+	}
 }
 
 // cccEventFiles fetches one event's detail and picks video+sub recordings.

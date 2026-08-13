@@ -31,7 +31,10 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) // best-effort; errors ignored
+	return s.db.Close()
+}
 
 func (s *Store) init() error {
 	stmts := []string{
@@ -146,11 +149,16 @@ func (s *Store) GetSource(id int64) (model.Source, error) {
 }
 
 func (s *Store) DeleteSource(id int64) error {
-	if _, err := s.db.Exec(`DELETE FROM videos WHERE source_id=?`, id); err != nil {
-		return err
+	for _, q := range []string{
+		`DELETE FROM video_files WHERE source_id=?`,
+		`DELETE FROM videos WHERE source_id=?`,
+		`DELETE FROM sources WHERE id=?`,
+	} {
+		if _, err := s.db.Exec(q, id); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.Exec(`DELETE FROM sources WHERE id=?`, id)
-	return err
+	return nil
 }
 
 func (s *Store) SetSourceEnum(srcID int64, count int64, complete bool) error {
@@ -346,7 +354,7 @@ func siteFor(kind string) string {
 	switch kind {
 	case model.KindYoutubeChannel, model.KindYoutubePlaylist:
 		return "youtube"
-	case model.KindBilibiliSpace:
+	case model.KindBilibiliSpace, model.KindBilibiliFav:
 		return "bilibili"
 	case model.KindPeertubeChannel, model.KindPeertubeSearch:
 		return "peertube"

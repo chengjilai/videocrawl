@@ -1,12 +1,17 @@
-// Package enum: source discovery. YouTube/bilibili go through yt-dlp flat
-// enumeration (verified: ~1 request per 30-100 videos, full history, not
-// time-biased). PeerTube/CCC/archive.org/RSS use native REST pagination —
-// simple JSON, no client complexity. Every source is paginated to the END
-// (oldest videos included), satisfying the no-time-bias requirement.
+// Package enum: source discovery. YouTube/bilibili spaces go through yt-dlp
+// flat enumeration (verified: ~1 request per 30-100 videos, full history, not
+// time-biased); bilibili favorites (收藏夹) use a native wbi-signed REST
+// enumerator (bilibili.go). PeerTube/CCC/archive.org/RSS use native REST
+// pagination — simple JSON, no client complexity. Every source is paginated
+// to the END (oldest videos included), satisfying the no-time-bias
+// requirement. Native pagination loops self-throttle at ~1 req/s
+// (enumPageSleep): the per-host limiter in app only gates whole enumerations,
+// so a single loop must not hammer the API.
 package enum
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +24,10 @@ import (
 	"videocrawl/internal/sites"
 	"videocrawl/internal/yt"
 )
+
+// enumPageSleep: minimum spacing between page requests of native REST
+// enumerators (the app-level limiter only gates whole enumerations).
+const enumPageSleep = time.Second
 
 // Entry: one discovered video, canonical across all sources.
 type Entry struct {
@@ -39,6 +48,8 @@ func ForKind(kind string) EnumFunc {
 	switch kind {
 	case "youtube-channel", "youtube-playlist", "bilibili-space":
 		return enumYTDLP
+	case "bilibili-fav":
+		return enumBiliFav
 	case "peertube-channel", "peertube-search":
 		return enumPeerTube
 	case "ccc-conf", "ccc-search":
@@ -53,11 +64,13 @@ func ForKind(kind string) EnumFunc {
 
 // ---- yt-dlp based ----
 
+var errLimit = errors.New("enum limit reached")
+
 func enumYTDLP(srcURL, _ string, cfg sites.Site, limit int, onEntry func(Entry) error) (int, bool, error) {
 	n := 0
 	_, ok, err := yt.Enum(cfg.EnumArgs, cfg.Cookies, sites.ProxyURL(cfg), srcURL, func(e yt.FlatEntry) error {
 		if limit > 0 && n >= limit {
-			return nil
+			return errLimit // kills the yt-dlp process; truncation is not complete
 		}
 		// flat entries from channel tabs may omit duration (shorts)
 		entry := Entry{
@@ -79,6 +92,9 @@ func enumYTDLP(srcURL, _ string, cfg sites.Site, limit int, onEntry func(Entry) 
 		n++
 		return nil
 	})
+	if errors.Is(err, errLimit) {
+		return n, false, nil // truncated: not complete
+	}
 	return n, ok, err
 }
 
@@ -160,6 +176,7 @@ func enumPeerTube(srcURL, query string, cfg sites.Site, limit int, onEntry func(
 		if int64(start) >= l.Total {
 			return n, true, nil
 		}
+		time.Sleep(enumPageSleep)
 	}
 }
 
@@ -267,6 +284,7 @@ func enumCCC(srcURL, query string, cfg sites.Site, limit int, onEntry func(Entry
 		if len(pg.Events) < 50 {
 			return n, true, nil
 		}
+		time.Sleep(enumPageSleep)
 		page++
 	}
 }
@@ -322,21 +340,98 @@ func extOf(name string) string {
 
 // ---- archive.org ----
 
+// archive scraping API: cursor-based, 1000 items/request (advancedsearch is
+// page-based and caps rows at 100 — 10x more requests for the same depth,
+// and its (page*rows) depth limit breaks on very large result sets).
+// Verified from here: services/search/v1/scrape returns {items,cursor,total}
+// with count min 100 / max 10000.
+type iaScrape struct {
+	Items []struct {
+		Identifier string          `json:"identifier"`
+		Title      json.RawMessage `json:"title"`
+		Date       string          `json:"date"`
+		Creator    json.RawMessage `json:"creator"`
+	} `json:"items"`
+	Cursor string `json:"cursor"`
+}
+
+func enumArchive(srcURL, query string, cfg sites.Site, limit int, onEntry func(Entry) error) (int, bool, error) {
+	client := httpClient(cfg)
+	// scrape first; any failure (query rejected, endpoint down) falls back to
+	// the known-good advancedsearch loop. Re-enumeration is idempotent (PK
+	// dedup), so a mid-run fallback only costs extra requests, never dups.
+	n, ok, err := enumArchiveScrape(client, query, limit, onEntry)
+	if err == nil {
+		return n, ok, nil
+	}
+	return enumArchiveLegacy(client, query, limit, onEntry)
+}
+
+func enumArchiveScrape(client *http.Client, query string, limit int, onEntry func(Entry) error) (int, bool, error) {
+	cursor := ""
+	n := 0
+	for {
+		u := "https://archive.org/services/search/v1/scrape?q=" + url.QueryEscape(query) +
+			"&fields=identifier,title,date,creator&count=1000"
+		if cursor != "" {
+			u += "&cursor=" + url.QueryEscape(cursor)
+		}
+		resp, err := client.Get(u)
+		if err != nil {
+			return n, false, err
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 429 {
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			return n, false, fmt.Errorf("archive.org scrape %d", resp.StatusCode)
+		}
+		var s iaScrape
+		if err := json.Unmarshal(b, &s); err != nil {
+			return n, false, err
+		}
+		for _, d := range s.Items {
+			if limit > 0 && n >= limit {
+				return n, true, nil
+			}
+			entry := Entry{
+				VideoID:   d.Identifier,
+				URL:       "https://archive.org/details/" + d.Identifier,
+				Title:     rawString(d.Title),
+				Channel:   rawString(d.Creator),
+				Published: date10(d.Date),
+			}
+			if err := onEntry(entry); err != nil {
+				return n, false, err
+			}
+			n++
+		}
+		if len(s.Items) == 0 || s.Cursor == "" {
+			return n, true, nil // exhausted: last page or empty result
+		}
+		cursor = s.Cursor
+		time.Sleep(enumPageSleep)
+	}
+}
+
+// iaSearch: legacy advancedsearch response (fallback path).
 type iaSearch struct {
 	Response struct {
 		NumFound int64 `json:"numFound"`
 		Start    int   `json:"start"`
 		Docs     []struct {
-			Identifier string          `json:"identifier"`
-			Title      json.RawMessage  `json:"title"`
-			Date       string          `json:"date"`
-			Creator    json.RawMessage  `json:"creator"`
+			Identifier string         `json:"identifier"`
+			Title      json.RawMessage `json:"title"`
+			Date       string         `json:"date"`
+			Creator    json.RawMessage `json:"creator"`
 		} `json:"docs"`
 	} `json:"response"`
 }
 
-func enumArchive(srcURL, query string, cfg sites.Site, limit int, onEntry func(Entry) error) (int, bool, error) {
-	client := httpClient(cfg)
+func enumArchiveLegacy(client *http.Client, query string, limit int, onEntry func(Entry) error) (int, bool, error) {
 	page := 0
 	n := 0
 	var total int64 = -1
@@ -369,10 +464,10 @@ func enumArchive(srcURL, query string, cfg sites.Site, limit int, onEntry func(E
 				return n, true, nil
 			}
 			entry := Entry{
-				VideoID:  d.Identifier,
-				URL:      "https://archive.org/details/" + d.Identifier,
-				Title:    rawString(d.Title),
-				Channel:  rawString(d.Creator),
+				VideoID:   d.Identifier,
+				URL:       "https://archive.org/details/" + d.Identifier,
+				Title:     rawString(d.Title),
+				Channel:   rawString(d.Creator),
 				Published: date10(d.Date),
 			}
 			if err := onEntry(entry); err != nil {
@@ -383,6 +478,7 @@ func enumArchive(srcURL, query string, cfg sites.Site, limit int, onEntry func(E
 		if int64(s.Response.Start+len(s.Response.Docs)) >= total {
 			return n, true, nil
 		}
+		time.Sleep(enumPageSleep)
 		page++
 	}
 }
@@ -499,7 +595,12 @@ func enumRSS(srcURL, _ string, cfg sites.Site, limit int, onEntry func(Entry) er
 func httpClient(cfg sites.Site) *http.Client {
 	dial := cfg.Dial
 	if dial == "" {
-		dial = "proxy"
+		// direct unless the site config actually resolves a proxy URL
+		// (netx.Client("proxy", "") would dial a bogus empty proxy)
+		dial = ""
+		if sites.ProxyURL(cfg) != "" {
+			dial = "proxy"
+		}
 	}
 	return netx.Client(dial, sites.ProxyURL(cfg), 90*time.Second)
 }

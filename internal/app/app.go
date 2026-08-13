@@ -2,6 +2,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -112,6 +113,12 @@ func normalize(kind, raw, query string) (string, string, error) {
 			return "", "", fmt.Errorf("bilibili-space needs a numeric mid or space URL, got %q", raw)
 		}
 		return "https://space.bilibili.com/" + mid + "/video", "", nil
+	case model.KindBilibiliFav:
+		fid := enum.BiliFavID(raw)
+		if fid == "" {
+			return "", "", fmt.Errorf("bilibili-fav needs a numeric media_id (fid) or a favlist URL, got %q", raw)
+		}
+		return "https://www.bilibili.com/medialist/detail/ml" + fid, "", nil
 	case model.KindPeertubeChannel:
 		if !strings.HasPrefix(raw, "http") {
 			return "", "", fmt.Errorf("peertube-channel needs a full URL: https://<instance>/video-channels/<handle>")
@@ -186,6 +193,11 @@ func allDigits(s string) bool {
 
 func guessName(kind, raw string) string {
 	raw = strings.Trim(raw, "/ ")
+	if kind == model.KindBilibiliFav {
+		if fid := enum.BiliFavID(raw); fid != "" {
+			return "bilibili-fav:" + fid
+		}
+	}
 	if i := strings.LastIndex(raw, "/"); i >= 0 {
 		raw = raw[i+1:]
 	}
@@ -216,7 +228,7 @@ func (a *App) Rm(id int64) error {
 
 // ---- enumerate ----
 
-func (a *App) Enumerate(concurrency, limit int, onlySource int64) error {
+func (a *App) Enumerate(ctx context.Context, concurrency, limit int, onlySource int64, deadline time.Time) error {
 	st, err := a.open()
 	if err != nil {
 		return err
@@ -245,12 +257,16 @@ func (a *App) Enumerate(concurrency, limit int, onlySource int64) error {
 	errs := make(chan error, len(jobs))
 	var wg sync.WaitGroup
 	for _, j := range jobs {
+		if dl.Expired(ctx, deadline) {
+			fmt.Fprintf(os.Stderr, "enumerate: stopping early (time budget/signal)\n")
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(j job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := a.enumOne(st, cfgs, lim, j.src, limit); err != nil {
+			if err := a.enumOne(ctx, deadline, st, cfgs, lim, j.src, limit); err != nil {
 				fmt.Fprintf(os.Stderr, "source #%d %s: %v\n", j.src.ID, j.src.URL, err)
 				errs <- err
 			}
@@ -268,7 +284,11 @@ func (a *App) Enumerate(concurrency, limit int, onlySource int64) error {
 	return nil
 }
 
-func (a *App) enumOne(st *store.Store, cfgs map[string]sites.Site, lim *politeness.Limiter, src model.Source, limit int) error {
+// errBudget aborts one source's scan when the round time budget or a stop
+// signal arrives mid-enumeration (checked at each entry boundary).
+var errBudget = errors.New("round time budget exceeded")
+
+func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, cfgs map[string]sites.Site, lim *politeness.Limiter, src model.Source, limit int) error {
 	fn := enum.ForKind(src.Kind)
 	if fn == nil {
 		return fmt.Errorf("no enumerator for %s", src.Kind)
@@ -279,6 +299,9 @@ func (a *App) enumOne(st *store.Store, cfgs map[string]sites.Site, lim *politene
 		lim.Wait(host)
 	}
 	count, complete, err := fn(src.URL, src.Query, cfg, limit, func(e enum.Entry) error {
+		if dl.Expired(ctx, deadline) {
+			return errBudget
+		}
 		if err := st.UpsertVideo(model.Video{
 			SourceID:  src.ID,
 			VideoID:   e.VideoID,
@@ -295,6 +318,12 @@ func (a *App) enumOne(st *store.Store, cfgs map[string]sites.Site, lim *politene
 		}
 		return nil
 	})
+	if errors.Is(err, errBudget) {
+		// budget/signal reached mid-scan: keep what we have, stop quietly
+		_ = st.SetSourceEnum(src.ID, int64(count), false)
+		fmt.Printf("source #%d %-22s %-9s %6d entries (stopped: time budget)\n", src.ID, src.Kind, src.URL, count)
+		return nil
+	}
 	if err != nil {
 		if host != "" {
 			lim.NoteError(host)
@@ -318,13 +347,23 @@ func (a *App) enumOne(st *store.Store, cfgs map[string]sites.Site, lim *politene
 func hostOf(rawurl string) string {
 	rawurl = strings.TrimPrefix(rawurl, "https://")
 	rawurl = strings.TrimPrefix(rawurl, "http://")
-	return strings.SplitN(rawurl, "/", 2)[0]
+	h := strings.SplitN(rawurl, "/", 2)[0]
+	// bilibili enumerations hit api/www/space/member hosts from one source;
+	// collapse the family so they share a single adaptive limiter slot.
+	switch h {
+	case "www.bilibili.com", "space.bilibili.com", "api.bilibili.com", "member.bilibili.com":
+		return "bilibili.com"
+	}
+	return h
 }
 
 // ---- download ----
 
-func (a *App) Download(limit, workers int, policy dl.Policy) error {
+func (a *App) Download(ctx context.Context, limit, workers int, policy dl.Policy, deadline time.Time) error {
 	if err := dl.EnsureDir(a.OutDir); err != nil {
+		return err
+	}
+	if err := checkDiskFree(a.OutDir); err != nil {
 		return err
 	}
 	st, err := a.open()
@@ -333,7 +372,7 @@ func (a *App) Download(limit, workers int, policy dl.Policy) error {
 	}
 	defer st.Close()
 	pool := dl.NewPool(st, a.sites(), a.OutDir, policy, workers)
-	if err := pool.Run(limit); err != nil {
+	if err := pool.Run(ctx, limit, deadline); err != nil {
 		return err
 	}
 	d, f, s := pool.Counts()
@@ -343,24 +382,45 @@ func (a *App) Download(limit, workers int, policy dl.Policy) error {
 
 // ---- crawl-loop ----
 
-func (a *App) CrawlLoop(every int, limit, workers int, rounds int, policy dl.Policy) error {
+func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds int, maxTime time.Duration, policy dl.Policy) error {
 	if err := dl.EnsureDir(a.OutDir); err != nil {
 		return err
 	}
 	round := 0
 	for {
-		round++
-		fmt.Printf("=== round %d %s ===\n", round, time.Now().Format("15:04:05"))
-		if err := a.Enumerate(2, 0, 0); err != nil {
-			fmt.Fprintf(os.Stderr, "enumerate: %v\n", err)
+		if ctx.Err() != nil {
+			fmt.Println("videocrawl: signal received, exiting loop")
+			return nil
 		}
-		if err := a.Download(limit, workers, policy); err != nil {
-			fmt.Fprintf(os.Stderr, "download: %v\n", err)
+		round++
+		deadline := time.Time{} // 0 = no per-round budget
+		if maxTime > 0 {
+			deadline = time.Now().Add(maxTime)
+		}
+		fmt.Printf("=== round %d %s (max-time %s) ===\n", round, time.Now().Format("15:04:05"), maxTime)
+		// (3) egress health: a dead tunnel / WARP socks would doom the round.
+		if err := checkTransports(); err != nil {
+			fmt.Fprintf(os.Stderr, "!! round %d skipped: %v\n", round, err)
+		} else {
+			if err := a.Enumerate(ctx, 2, 0, 0, deadline); err != nil {
+				fmt.Fprintf(os.Stderr, "enumerate: %v\n", err)
+			}
+			// (1) disk headroom before the download pass.
+			if err := checkDiskFree(a.OutDir); err != nil {
+				fmt.Fprintf(os.Stderr, "!! download pass skipped: %v (retry next round)\n", err)
+			} else if err := a.Download(ctx, limit, workers, policy, deadline); err != nil {
+				fmt.Fprintf(os.Stderr, "download: %v\n", err)
+			}
 		}
 		if rounds > 0 && round >= rounds {
 			return nil
 		}
-		time.Sleep(time.Duration(every) * time.Second)
+		select {
+		case <-ctx.Done():
+			fmt.Println("videocrawl: signal received, exiting loop")
+			return nil
+		case <-time.After(time.Duration(every) * time.Second):
+		}
 	}
 }
 
