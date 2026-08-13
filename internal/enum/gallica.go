@@ -22,6 +22,7 @@
 //     as the challenge trigger.
 //   - musget has no exported ark extractor (GallicaArk, used below) and
 //     no netx dial-mode transport.
+//
 // To wire musget later: first upstream the streamed + no-total-timeout +
 // error-path-altcha behavior into musget/pkg/gallica and export an Ark
 // helper, then replace this file with a thin wrapper. The mechanics are
@@ -31,6 +32,7 @@
 package enum
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -166,6 +168,13 @@ func stripGallicaTags(s string) string {
 // anti-bot challenge: an unverified session gets 403 "Access Interdit", a
 // 429, or a 200 HTML challenge page instead of the PDF — any of those
 // triggers the PoW solve (once per session, cookie reused).
+//
+// Current BnF backend: the altcha/verify POST itself 302-redirects to the
+// PDF (set-cookie altcha_pass, single-use) — the client follows it and the
+// verify response body IS the PDF, while a subsequent GET of the PDF URL
+// 403s. solveAltcha therefore captures the PDF from the verify response
+// when present; the old flow (verify returns an empty ok, PDF fetched on
+// the next GET) is kept as fallback.
 func (c *Gallica) Download(ctx context.Context, ark, dest string) error {
 	u := fmt.Sprintf("%s/ark:/12148/%s.pdf", gallicaBase, ark)
 	// Probe once: a verified session streams the PDF directly; an
@@ -177,15 +186,19 @@ func (c *Gallica) Download(ctx context.Context, ark, dest string) error {
 	if err := c.getToN(ctx, u, dest, 1); err == nil && FileIsPDF(dest) {
 		return nil
 	}
+	got := false
 	if !c.verified {
-		if err := c.solveAltcha(ctx, u); err != nil {
+		var err error
+		if got, err = c.solveAltcha(ctx, u, dest); err != nil {
 			return fmt.Errorf("altcha: %w", err)
 		}
 		c.verified = true
 	}
-	if err := c.getToN(ctx, u, dest, c.MaxTries); err != nil {
-		os.Remove(dest + ".part")
-		return err
+	if !got {
+		if err := c.getToN(ctx, u, dest, c.MaxTries); err != nil {
+			os.Remove(dest + ".part")
+			return err
+		}
 	}
 	if !FileIsPDF(dest) || fileSize0(dest) == 0 {
 		os.Remove(dest + ".part")
@@ -346,8 +359,12 @@ func gallicaWait(ctx context.Context, try int) error {
 	}
 }
 
-// solveAltcha performs the full PoW flow and keeps the session cookie.
-func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
+// solveAltcha performs the full PoW flow and keeps the session cookie. If
+// pdfDest is non-empty and BnF answers the verify POST with the PDF itself
+// (current backend: 302 to the PDF with a single-use altcha_pass cookie,
+// which the client follows), the PDF is streamed to pdfDest and gotPDF=true
+// is returned so Download can skip the (now 403ing) refetch.
+func (c *Gallica) solveAltcha(ctx context.Context, referer, pdfDest string) (bool, error) {
 	// seed a session (single attempt: a gate response still sets the
 	// session cookie; retrying a rate-limited seed just keeps BnF's
 	// limiter hot)
@@ -355,7 +372,7 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 	// fetch challenge
 	body, err := c.getBytes(ctx, gallicaBase+"/services/engine/search/altcha/challenge", map[string]string{"Referer": referer})
 	if err != nil {
-		return err
+		return false, err
 	}
 	var ch struct {
 		Algorithm string `json:"algorithm"`
@@ -365,10 +382,10 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 		Signature string `json:"signature"`
 	}
 	if err := json.Unmarshal(body, &ch); err != nil {
-		return fmt.Errorf("challenge json: %w", err)
+		return false, fmt.Errorf("challenge json: %w", err)
 	}
 	if ch.Algorithm != "SHA-256" {
-		return fmt.Errorf("unsupported altcha algorithm %q", ch.Algorithm)
+		return false, fmt.Errorf("unsupported altcha algorithm %q", ch.Algorithm)
 	}
 	maxN := ch.Maxnumber
 	if maxN <= 0 {
@@ -383,11 +400,11 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 			break
 		}
 		if n%50000 == 0 && time.Since(start) > 20*time.Second {
-			return fmt.Errorf("altcha solve timed out at %d", n)
+			return false, fmt.Errorf("altcha solve timed out at %d", n)
 		}
 	}
 	if sol < 0 {
-		return fmt.Errorf("altcha no solution in [0,%d]", maxN)
+		return false, fmt.Errorf("altcha no solution in [0,%d]", maxN)
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"algorithm": ch.Algorithm,
@@ -401,12 +418,12 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 	var lastErr error
 	for try := 0; try < c.MaxTries; try++ {
 		if err := gallicaWait(ctx, try); err != nil {
-			return err
+			return false, err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			gallicaBase+"/services/engine/search/altcha/verify", strings.NewReader(form))
 		if err != nil {
-			return err
+			return false, err
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -417,8 +434,12 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 			continue
 		}
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound {
-			resp.Body.Close()
-			return nil
+			got, cerr := capturePDF(resp, pdfDest)
+			if cerr != nil {
+				lastErr = cerr
+				continue
+			}
+			return got, nil
 		}
 		// 429, 403 and 5xx are transient rate-limit/WAF errors: retry with
 		// backoff (BnF's WAF escalates to 403 before hard-dropping an IP;
@@ -429,9 +450,51 @@ func (c *Gallica) solveAltcha(ctx context.Context, referer string) error {
 			continue
 		}
 		resp.Body.Close()
-		return fmt.Errorf("altcha verify HTTP %d", resp.StatusCode)
+		return false, fmt.Errorf("altcha verify HTTP %d", resp.StatusCode)
 	}
-	return lastErr
+	return false, lastErr
+}
+
+// capturePDF inspects a 200/302 altcha-verify response: when its body is a
+// PDF (current BnF backend redirects the verify POST to the PDF itself), it
+// is streamed to dest+.".part" and atomically renamed; got=true is
+// returned. An empty/non-PDF body (old backend: "verified, go fetch") is
+// consumed and returns got=false so the caller falls back to the PDF GET.
+func capturePDF(resp *http.Response, dest string) (bool, error) {
+	defer resp.Body.Close()
+	if dest == "" {
+		io.Copy(io.Discard, resp.Body)
+		return false, nil
+	}
+	br := bufio.NewReader(resp.Body)
+	magic, err := br.Peek(4)
+	if err != nil || string(magic) != "%PDF" {
+		io.Copy(io.Discard, br)
+		return false, nil
+	}
+	part := dest + ".part"
+	f, ferr := os.Create(part)
+	if ferr != nil {
+		return false, ferr
+	}
+	_, cerr := io.Copy(f, br)
+	ferr = f.Close()
+	if cerr != nil || ferr != nil {
+		os.Remove(part)
+		if cerr != nil {
+			return false, cerr
+		}
+		return false, ferr
+	}
+	if !FileIsPDF(part) || fileSize0(part) == 0 {
+		os.Remove(part)
+		return false, fmt.Errorf("gallica: captured verify body is not a valid PDF")
+	}
+	if err := os.Rename(part, dest); err != nil {
+		os.Remove(part)
+		return false, err
+	}
+	return true, nil
 }
 
 // enumGallica: a gallica source is one ark; enumeration emits its single
