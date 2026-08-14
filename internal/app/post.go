@@ -116,7 +116,11 @@ func (s *postState) save() error {
 		b.Write(j)
 		b.WriteByte('\n')
 	}
-	return os.WriteFile(s.path, []byte(b.String()), 0o644)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path) // atomic: a crash never truncates the live state
 }
 
 func (s *postState) enqueue(seed string) error {
@@ -157,6 +161,10 @@ func pdYear(m map[string]any) int {
 					return n
 				}
 			}
+		case float64:
+			if t >= 1800 && t <= 2100 {
+				return int(t)
+			}
 		case []any:
 			for _, e := range t {
 				if s, ok := e.(string); ok {
@@ -193,7 +201,7 @@ func existingBiliTitles() map[string]bool {
 	if json.Unmarshal(sess, &js) != nil || js.Cookie == "" {
 		return out
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://member.bilibili.com/x/web/archives?pn=1&ps=50&status=all", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://member.bilibili.com/x/web/archives?pn=1&ps=100&status=all", nil)
 	if err != nil {
 		return out
 	}
@@ -220,6 +228,33 @@ func existingBiliTitles() map[string]bool {
 	}
 	for _, a := range d.Data.Archives {
 		out[normalizeTitle(a.Title)] = true
+	}
+	// paginate: the account already exceeds 50 videos, older titles are the
+	// dup risk — keep walking pages until one comes back empty.
+	for pn := 2; len(d.Data.Archives) > 0 && pn < 20; pn++ {
+		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://member.bilibili.com/x/web/archives?pn=%d&ps=100&status=all", pn), nil)
+		req.Header.Set("Cookie", js.Cookie)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			break
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		var pg struct {
+			Data struct {
+				Archives []struct {
+					Title string `json:"title"`
+				} `json:"archives"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(body, &pg) != nil {
+			break
+		}
+		d = pg
+		for _, a := range d.Data.Archives {
+			out[normalizeTitle(a.Title)] = true
+		}
 	}
 	return out
 }
@@ -373,6 +408,9 @@ func PostLoop(args []string) error {
 	checkBili := fs.Bool("check-bili", false, "skip titles already on the account")
 	noUpload := fs.Bool("no-upload", false, "download+encode only (upload from another machine)")
 	jobsN := fs.Int("jobs", 4, "parallel audio downloads")
+	if *jobsN < 1 {
+		*jobsN = 1
+	}
 	uploadOnly := fs.Bool("upload-only", false, "upload items already staged as videos (state+Videos/Post synced)")
 	state := fs.String("state", defaultStatePath(), "state file")
 	videoDir := fs.String("video-dir", filepath.Join(mustHome(), "Videos", "Post"), "staged video directory")
@@ -414,9 +452,13 @@ func PostLoop(args []string) error {
 		// has posts means the archives API hiccuped (observed 2026-08-14:
 		// '0 existing titles' despite 55 live) — posting blind risks dups
 		// (the Mozart double-post). Skip the round instead.
-		if *checkBili && len(existing) == 0 && len(st.items) > 0 {
-			logf("[check-bili] 0 titles but %d tracked items — API hiccup, skipping round", len(st.items))
-			return nil
+		if *checkBili && len(existing) == 0 {
+			for _, it := range st.items {
+				if it.BVID != "" {
+					logf("[check-bili] 0 titles but %d posted bvids tracked — API hiccup, skipping round", len(existing))
+					return nil
+				}
+			}
 		}
 		n := 0
 		for _, it := range st.items {
@@ -487,7 +529,7 @@ func PostLoop(args []string) error {
 			if posted >= *limit {
 				break
 			}
-			if *noUpload && it.Status == "downloaded" {
+			if it.Status == "downloaded" {
 				if _, err := os.Stat(filepath.Join(*videoDir, it.ID+".mp4")); err == nil {
 					logf("    already staged, skip")
 					continue
@@ -559,21 +601,23 @@ func PostLoop(args []string) error {
 				st.save()
 				continue
 			}
+			audioPaths := make([]string, len(files))
 			var (
-				audioPaths []string
-				mu         sync.Mutex
-				dlFail     string
-				wg         sync.WaitGroup
-				sem        = make(chan struct{}, *jobsN)
+				mu     sync.Mutex
+				dlFail string
+				wg     sync.WaitGroup
+				sem    = make(chan struct{}, *jobsN)
 			)
-			for _, f := range files {
-				name := f.Name
+			for i, f := range files {
+				i, name := i, f.Name
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					dest := filepath.Join(workDir, sanitizeName(filepath.Base(name)))
+					// index-based dest: preserves track order for the concat and
+					// avoids basename collisions (Disc1/01.mp3 vs Disc2/01.mp3)
+					dest := filepath.Join(workDir, fmt.Sprintf("%02d-%s", i, sanitizeName(filepath.Base(name))))
 					if err := dl.FetchResume(ac, dl.ArchiveDirectURL(item, it.ID, name), dest+".part", dest); err != nil {
 						mu.Lock()
 						if dlFail == "" {
@@ -582,9 +626,7 @@ func PostLoop(args []string) error {
 						mu.Unlock()
 						return
 					}
-					mu.Lock()
-					audioPaths = append(audioPaths, dest)
-					mu.Unlock()
+					audioPaths[i] = dest
 				}()
 			}
 			wg.Wait()
@@ -620,13 +662,19 @@ func PostLoop(args []string) error {
 			}
 			tags := "古典音乐,历史录音"
 			for _, w := range strings.Fields(strings.NewReplacer(".", " ", ",", " ", "&", " ").Replace(creator)) {
-				if len(tags) < 60 && !strings.Contains(tags, w) {
+				w = strings.Trim(w, "【】（）()[]——,.:。 ")
+				if len([]rune(w)) >= 2 && len([]rune(w)) <= 18 && !strings.Contains(tags, w) {
 					tags += "," + w
+					if strings.Count(tags, ",") >= 8 {
+						break
+					}
 				}
 			}
 			bvid, err := postUpload(ctx, out, title, "https://archive.org/details/"+it.ID, tags, buildDesc(creator, item.Title, year, label, "https://archive.org/details/"+it.ID))
 			if err != nil {
-				it.Status, it.Reason = "failed", "upload: "+err.Error()
+				// keep "downloaded": the staged mp4 exists, next round retries
+				// the upload only (bilibili rate limits are transient)
+				it.Reason = "upload: " + err.Error()
 				logf("    FAIL upload: %v", err)
 				st.save()
 				continue
