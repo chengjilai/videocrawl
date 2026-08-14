@@ -550,7 +550,11 @@ func PostLoop(args []string) error {
 			if *every <= 0 {
 				break
 			}
-			time.Sleep(time.Duration(*every) * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Duration(*every) * time.Second):
+			}
 			continue
 		}
 		logf("[round %d] %d queued, posting up to %d", round, len(cands), *limit)
@@ -717,7 +721,11 @@ func PostLoop(args []string) error {
 		if *every <= 0 {
 			break
 		}
-		time.Sleep(time.Duration(*every) * time.Second)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Duration(*every) * time.Second):
+		}
 	}
 	return nil
 }
