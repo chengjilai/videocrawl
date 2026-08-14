@@ -5,6 +5,7 @@ package yt
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -158,13 +159,14 @@ func GetMeta(extra []string, cookies, proxy, url string) (*MetaEntry, error) {
 // that bilibili's transcode rejected (缺少视频轨). DASH streams (134+140)
 // download fully through the same path.
 // 720p H.264 mp4 archive-grade, unique per-video output path (id kills
-// title collisions), .part temp on the same filesystem, resume, en subs.
+// title collisions), .part temp on the same filesystem, resume.
 // With audioFormat != "" the download is audio-only: -x extracts the best
 // audio (--audio-quality 0 = best), converted to the requested format.
-// Subs: --write-subs (manual/uploader captions, incl. PeerTube .en.vtt)
-// + --write-auto-subs (auto-generated). On YouTube manual subs land as
-// <id>.en.srt and auto as <id>.en-orig.srt; the transcript gate below
-// prefers the longest id-prefixed sub file of the two.
+// NO subtitle flags here: yt-dlp fetches subs BEFORE the video in
+// process_info and aborts the whole download on any sub failure (a
+// timedtext 429 through the shared proxy IP killed whole downloads with
+// zero video bytes on disk). Subs come from the separate best-effort
+// SubtitleCmd pass (see RunWithRetry).
 func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat string, extra []string, url string) *exec.Cmd {
 	args := []string{
 		"--no-playlist",
@@ -174,7 +176,6 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat strin
 		"--restrict-filenames",
 		"-P", "temp:" + outDir + "/.tmp",
 		"-P", "home:" + outDir,
-		"--write-subs", "--write-auto-subs", "--sub-langs", "en.*", "--sub-format", "srt/best",
 		"--concurrent-fragments", "8",
 		"--max-filesize", "4G",
 		"--retry-sleep", "fragment:exp=1:10",
@@ -221,6 +222,74 @@ func RunDownload(cmd *exec.Cmd) error {
 		return fmt.Errorf("%s", firstLine(msg))
 	}
 	return nil
+}
+
+// SubtitleCmd builds the sub-only pass: --skip-download + the subtitle
+// flags, same output template as DownloadCmd so subs land next to the
+// video (the transcript gate reads them there; on YouTube manual subs are
+// <id>.en.srt and auto <id>.en-orig.srt — the gate prefers the longest
+// id-prefixed sub of the two). Run via RunWithRetry: yt-dlp fetches subs
+// BEFORE the video (process_info) and aborts the whole download on any
+// sub failure, so subs must never ride along with the video.
+// --sub-langs is the exact pair en,en-orig — NOT the en.* regex: the
+// regex fans out into ~11 tracks (en-zh-CN, en-cs, en-fr, ... auto-
+// TRANSLATED subs), each a timedtext request (429 fuel through the shared
+// proxy IP), and the translated text can be the longest file the gate
+// scores against an English corpus.
+func SubtitleCmd(cookies, proxy, outDir, url string) *exec.Cmd {
+	args := []string{
+		"--no-playlist",
+		"--skip-download",
+		"-o", "%(channel)s/%(id)s_%(title).100B.%(ext)s",
+		"--restrict-filenames",
+		"-P", "temp:" + outDir + "/.tmp",
+		"-P", "home:" + outDir,
+		"--write-subs", "--write-auto-subs", "--sub-langs", "en,en-orig", "--sub-format", "srt/best",
+		"--no-warnings",
+		"--socket-timeout", "60",
+	}
+	if cookies != "" {
+		args = append(args, "--cookies", cookies)
+	}
+	if proxy != "" {
+		args = append(args, "--proxy", proxy)
+	}
+	args = append(args, "--", url)
+	return exec.Command(Bin(), args...)
+}
+
+// RunWithRetry runs cmd, retrying with the given sleeps between attempts
+// (backoff; ctx cancellation aborts between attempts). Each attempt gets a
+// fresh *exec.Cmd built from the same args. Returns the last error when
+// all attempts fail — the caller decides; a best-effort helper must never
+// turn its own failure into the caller's.
+func RunWithRetry(ctx context.Context, cmd *exec.Cmd, sleeps ...time.Duration) error {
+	base := append([]string(nil), cmd.Args...)
+	run := func() error {
+		c := exec.Command(base[0], base[1:]...)
+		var stderr bytes.Buffer
+		c.Stderr = &stderr
+		if err := c.Run(); err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg == "" {
+				msg = err.Error()
+			}
+			return fmt.Errorf("%s", firstLine(msg))
+		}
+		return nil
+	}
+	var lastErr error
+	for i := 0; ; i++ {
+		lastErr = run()
+		if lastErr == nil || i >= len(sleeps) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleeps[i]):
+		}
+	}
 }
 
 // ParseUploadDate converts YYYYMMDD to RFC3339 date ("" on empty).

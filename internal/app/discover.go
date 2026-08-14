@@ -8,7 +8,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -643,9 +642,12 @@ func (a *App) discoverCCC(ctx context.Context, g *gates, lim *politeness.Limiter
 // ---- transcripts ----
 
 // discoverTranscripts: for the top-N survivors, fetch auto-subs with
-// yt-dlp into a temp dir (--write-auto-subs --sub-langs en.*
-// --sub-format srt/best --skip-download), extract the plain text with the
-// dl transcript pattern, and score it against the corpus
+// yt-dlp into a temp dir (--skip-download --write-auto-subs --sub-langs
+// en,en-orig --sub-format srt/best — the exact pair, NOT the en.* regex
+// which fans out into ~11 translated tracks and 429s; see yt.SubtitleCmd),
+// retrying with backoff (the subs API 429s through the shared proxy IP),
+// extract the plain text with the dl transcript pattern, and score it
+// against the corpus
 // (VIDEOCRAWL_TRANSCRIPT_THRESHOLD, default 0.15). Report only — nothing
 // is written to the DB.
 func (a *App) discoverTranscripts(ctx context.Context, g *gates, lim *politeness.Limiter, results []candidate, jsonOut bool) error {
@@ -665,7 +667,7 @@ func (a *App) discoverTranscripts(ctx context.Context, g *gates, lim *politeness
 		}
 		lim.Wait("youtube.com")
 		args := []string{
-			"--skip-download", "--write-auto-subs", "--sub-langs", "en.*",
+			"--skip-download", "--write-auto-subs", "--sub-langs", "en,en-orig",
 			"--sub-format", "srt/best", "--no-playlist", "--no-warnings",
 			"--socket-timeout", "60",
 			"-o", "discover-subs/%(id)s.%(ext)s",
@@ -676,9 +678,7 @@ func (a *App) discoverTranscripts(ctx context.Context, g *gates, lim *politeness
 		}
 		cmd := exec.Command(yt.Bin(), args...)
 		cmd.Args = append(cmd.Args, "--", c.URL)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		_ = cmd.Run() // failures just mean no subs
+		_ = yt.RunWithRetry(ctx, cmd, 30*time.Second, 60*time.Second) // failures just mean no subs
 		text := dl.TranscriptText(tmp, c.VideoID)
 		sc := 0.0
 		if text != "" {

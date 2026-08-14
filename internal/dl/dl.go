@@ -153,7 +153,7 @@ func (p *Pool) Run(ctx context.Context, limit int, deadline time.Time) error {
 			go func(v model.Video) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if err := p.process(v); err != nil {
+				if err := p.process(ctx, v); err != nil {
 					if errors.Is(err, errSkipped) {
 						p.mu.Lock()
 						p.skip++
@@ -182,7 +182,7 @@ func (p *Pool) Run(ctx context.Context, limit int, deadline time.Time) error {
 
 var errSkipped = errors.New("skipped")
 
-func (p *Pool) process(v model.Video) error {
+func (p *Pool) process(ctx context.Context, v model.Video) error {
 	src, err := p.store.GetSource(v.SourceID)
 	if err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "source: "+err.Error())
@@ -257,9 +257,20 @@ func (p *Pool) process(v model.Video) error {
 			fmt.Sprintf("truncated download: %d bytes for %ds", size, v.Duration))
 		return fmt.Errorf("truncated download: %d bytes for %ds", size, v.Duration)
 	}
-	// 3b. transcript relevance gate: video + subs are on disk now. Missing
-	// transcript = pass; a transcript scoring below the threshold skips.
-	// The score is recorded on MarkDownloaded (0 when no transcript).
+	// 3b. subtitles: separate best-effort pass — yt-dlp fetches subs BEFORE
+	// the video (process_info) and aborts the whole download on any sub
+	// failure; a timedtext 429 through the shared proxy IP killed whole
+	// GNOME/GOTO downloads with zero video bytes on disk. The video is
+	// verified on disk now, so retry the subs with backoff and continue
+	// regardless — the transcript gate below passes leniently without one.
+	if err := yt.RunWithRetry(ctx, yt.SubtitleCmd(cfg.Cookies, proxy, p.outDir, v.URL),
+		30*time.Second, 60*time.Second, 120*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "subtitles: %s: %v (video kept, gate lenient)\n", v.VideoID, err)
+	}
+	// 3c. transcript relevance gate: video is on disk; subs may or may not
+	// be (best-effort pass above). Missing transcript = pass; a transcript
+	// scoring below the threshold skips. The score is recorded on
+	// MarkDownloaded (0 when no transcript).
 	tsScore, err := p.gateTranscript(v)
 	if err != nil {
 		return err // errSkipped: marked "transcript" in gateTranscript
