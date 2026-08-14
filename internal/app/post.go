@@ -313,7 +313,28 @@ func escDraw(s string) string {
 }
 
 func findFont() string {
+	// The title card mixes Latin + Chinese (e.g. "De Greef 演奏 Grieg
+	// Op.16 (1921年录音)"); the old TeX Gyre hardcode has NO CJK glyphs,
+	// so the Chinese rendered as tofu blocks in the thumbnail. Resolve a
+	// CJK-capable font via fontconfig at runtime (store paths drift
+	// across nixpkgs/Arch updates), then fall back to known paths.
+	if out, err := exec.Command("fc-match", "-f", "%{file}", "Noto Sans CJK SC:bold:lang=zh-cn").Output(); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && p != "/dev/null" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	if out, err := exec.Command("fc-match", "-f", "%{file}", "Noto Sans CJK SC:lang=zh-cn").Output(); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && p != "/dev/null" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
 	cands := []string{
+		"/nix/store/b49wabix3cda3hgw8ki8dk3fwywkyqhn-noto-fonts-cjk-sans-2.004/share/fonts/opentype/noto-cjk/NotoSansMonoCJK-VF.otf.ttc",
+		"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", // Arch
 		"/nix/store/dm5cigvarwb6h9kl9q0yjasjyllksrfk-gyre-fonts-2.501/share/fonts/opentype/texgyreheros-bold.otf",
 	}
 	for _, c := range cands {
