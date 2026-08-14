@@ -82,10 +82,11 @@ if ! sqlite3 "$DB" 'PRAGMA integrity_check;' 2>/dev/null | grep -q '^ok'; then
 fi
 
 # 3. upload pass (one video; paced by start-upload-loop.sh)
-# Licensing gate: 'cc' = media.ccc.de (CC BY by documentation); 'pt' = all
-# peertube sources (trust-at-seed — only curated tech channels are added).
-# YouTube stays excluded. Override: ALLOWLIST=cc,pt,6 ./sync-upload.sh
-ALLOWLIST="${ALLOWLIST:-cc,pt}"
+# Licensing gate: 'cc' = media.ccc.de; 'pt' = peertube sources; numeric ids =
+# the curated conference YouTube channels (22 GOTO, 23 Code Sync/Lambda
+# Days, 24 ScalaCon) — their downloads already passed the semantic +
+# transcript gates. Override: ALLOWLIST=cc,pt,22 ./sync-upload.sh
+ALLOWLIST="${ALLOWLIST:-cc,pt,22,23,24}"
 args=(--upload-allowlist "$ALLOWLIST" --limit "$UPLOAD_LIMIT" --path-prefix-rewrite "$REWRITE")
 if [ "$DRY_RUN" = 1 ]; then
   args+=(--dry-run)
