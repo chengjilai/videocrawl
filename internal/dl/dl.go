@@ -632,29 +632,40 @@ func destLock(dest string) *sync.Mutex {
 // subtitles (small) and as the single-stream fallback in fetchStriped
 // (no-range servers, small files, probe failures).
 func FetchResume(client *http.Client, url, tmp, dst string) error {
+	return FetchResumeCtx(context.Background(), client, url, tmp, dst)
+}
+
+// FetchResumeCtx is FetchResume with a cancellable context — the music
+// post-loop passes its signal context so SIGTERM aborts an in-flight
+// download instead of finishing it.
+func FetchResumeCtx(ctx context.Context, client *http.Client, url, tmp, dst string) error {
 	const maxAttempts = 8
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := fetchOnce(client, url, tmp)
+		err := fetchOnce(ctx, client, url, tmp)
 		if err == nil {
 			return os.Rename(tmp, dst)
 		}
 		lastErr = err
 		if attempt < maxAttempts {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
 		}
 	}
 	return lastErr
 }
 
-func fetchOnce(client *http.Client, url, tmp string) error {
+func fetchOnce(ctx context.Context, client *http.Client, url, tmp string) error {
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	resume, _ := f.Stat()
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("User-Agent", "videocrawl/1.0")
 	if resume.Size() > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resume.Size()))

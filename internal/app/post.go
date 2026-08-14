@@ -652,7 +652,7 @@ func PostLoop(args []string) error {
 					// index-based dest: preserves track order for the concat and
 					// avoids basename collisions (Disc1/01.mp3 vs Disc2/01.mp3)
 					dest := filepath.Join(workDir, fmt.Sprintf("%02d-%s", i, sanitizeName(filepath.Base(name))))
-					if err := dl.FetchResume(ac, dl.ArchiveDirectURL(item, it.ID, name), dest+".part", dest); err != nil {
+					if err := dl.FetchResumeCtx(ctx, ac, dl.ArchiveDirectURL(item, it.ID, name), dest+".part", dest); err != nil {
 						mu.Lock()
 						if dlFail == "" {
 							dlFail = fmt.Sprintf("download %s: %v", name, err)
