@@ -521,7 +521,16 @@ func (a *App) Upload(limit int, dryRun bool, allowlist, pathPrefixRewrite, outDi
 	if limit <= 0 {
 		limit = 1 << 30
 	}
-	rows, err := st.NextForUpload(limit)
+	// Fetch with headroom so disallowed rows (youtube) can't starve the
+	// round: NextForUpload orders by earliest-published, and with limit=1 a
+	// single skipped row previously blocked everything behind it. The done
+	// queue is small (~100 rows), so 50x limit covers it; at most `limit`
+	// uploads still happen (the loop breaks at ok == limit).
+	fetchN := limit * 50
+	if fetchN < 500 {
+		fetchN = 500
+	}
+	rows, err := st.NextForUpload(fetchN)
 	if err != nil {
 		return err
 	}
@@ -549,6 +558,12 @@ func (a *App) Upload(limit int, dryRun bool, allowlist, pathPrefixRewrite, outDi
 	}
 	ok, fail, skip := 0, 0, 0
 	for _, v := range rows {
+		// attempts (ok+fail) count toward limit too: a burst of failures
+		// (e.g. bilibili risk-control 403s) must end the round, not hammer
+		// the endpoint 64x like the first cc,5 round did.
+		if ok+fail >= limit {
+			break
+		}
 		src, err := st.GetSource(v.SourceID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "upload: FAIL %s (%s): source #%d: %v\n", v.VideoID, v.URL, v.SourceID, err)
