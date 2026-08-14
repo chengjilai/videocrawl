@@ -82,7 +82,12 @@ if ! sqlite3 "$DB" 'PRAGMA integrity_check;' 2>/dev/null | grep -q '^ok'; then
 fi
 
 # 3. upload pass (one video; paced by start-upload-loop.sh)
-args=(--upload-allowlist cc --limit "$UPLOAD_LIMIT" --path-prefix-rewrite "$REWRITE")
+# Licensing gate: 'cc' = media.ccc.de (CC BY by documentation); numeric ids =
+# vouched sources. 5 = tilvids (FOSS PeerTube instance, CC by platform
+# convention; the API records no per-video license). YouTube stays excluded.
+# Override: ALLOWLIST=cc,5,6 ./sync-upload.sh
+ALLOWLIST="${ALLOWLIST:-cc,5}"
+args=(--upload-allowlist "$ALLOWLIST" --limit "$UPLOAD_LIMIT" --path-prefix-rewrite "$REWRITE")
 if [ "$DRY_RUN" = 1 ]; then
   args+=(--dry-run)
 fi
