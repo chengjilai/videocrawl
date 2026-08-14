@@ -35,7 +35,6 @@ import (
 
 	"videocrawl/internal/app"
 	"videocrawl/internal/dl"
-	"videocrawl/internal/model"
 )
 
 func main() {
@@ -222,6 +221,3 @@ func reorderArgs(args []string, boolFlags map[string]bool) []string {
 	}
 	return append(flags, pos...)
 }
-
-var _ = model.StatusNew
-var _ = strings.TrimSpace

@@ -1,18 +1,6 @@
-# github.com/andybalholm/cascadia v1.3.2
-## explicit; go 1.16
-github.com/andybalholm/cascadia
 # github.com/dustin/go-humanize v1.0.1
 ## explicit; go 1.16
 github.com/dustin/go-humanize
-# github.com/forPelevin/gomoji v1.2.0
-## explicit; go 1.19
-github.com/forPelevin/gomoji
-# github.com/go-shiori/dom v0.0.0-20230515143342-73569d674e1c
-## explicit; go 1.20
-github.com/go-shiori/dom
-# github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
-## explicit
-github.com/gogs/chardet
 # github.com/google/uuid v1.6.0
 ## explicit
 github.com/google/uuid
@@ -25,44 +13,12 @@ github.com/ncruces/go-strftime
 # github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec
 ## explicit; go 1.12
 github.com/remyoudompheng/bigfft
-# github.com/rivo/uniseg v0.4.3
-## explicit; go 1.18
-github.com/rivo/uniseg
-# golang.org/x/net v0.58.0
-## explicit; go 1.25.0
-golang.org/x/net/html
-golang.org/x/net/html/atom
-golang.org/x/net/html/charset
-golang.org/x/net/http/httpproxy
-golang.org/x/net/idna
 # golang.org/x/sys v0.47.0
 ## explicit; go 1.25.0
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.41.0
+# golang.org/x/tools v0.48.0
 ## explicit; go 1.25.0
-golang.org/x/text/cases
-golang.org/x/text/encoding
-golang.org/x/text/encoding/charmap
-golang.org/x/text/encoding/htmlindex
-golang.org/x/text/encoding/internal
-golang.org/x/text/encoding/internal/identifier
-golang.org/x/text/encoding/japanese
-golang.org/x/text/encoding/korean
-golang.org/x/text/encoding/simplifiedchinese
-golang.org/x/text/encoding/traditionalchinese
-golang.org/x/text/encoding/unicode
-golang.org/x/text/internal
-golang.org/x/text/internal/language
-golang.org/x/text/internal/language/compact
-golang.org/x/text/internal/tag
-golang.org/x/text/internal/utf8internal
-golang.org/x/text/language
-golang.org/x/text/runes
-golang.org/x/text/secure/bidirule
-golang.org/x/text/transform
-golang.org/x/text/unicode/bidi
-golang.org/x/text/unicode/norm
 # modernc.org/libc v1.74.4
 ## explicit; go 1.25.0
 modernc.org/libc

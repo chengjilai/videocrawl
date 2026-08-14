@@ -10,22 +10,22 @@ import (
 )
 
 type hostState struct {
-	last   time.Time
-	gap    time.Duration
-	mu     sync.Mutex
+	last time.Time
+	gap  time.Duration
+	mu   sync.Mutex
 }
 
 type Limiter struct {
-	min  time.Duration
-	max  time.Duration
-	mu   sync.Mutex
+	min   time.Duration
+	max   time.Duration
+	mu    sync.Mutex
 	hosts map[string]*hostState
 }
 
 func New(minInterval time.Duration) *Limiter {
 	return &Limiter{
-		min:  minInterval,
-		max:  minInterval * 64,
+		min:   minInterval,
+		max:   minInterval * 64,
 		hosts: map[string]*hostState{},
 	}
 }
@@ -78,6 +78,3 @@ func (l *Limiter) NoteError(key string) {
 		h.gap = l.max
 	}
 }
-
-// HostKey returns the politeness key for a URL host.
-func HostKey(host string) string { return host }

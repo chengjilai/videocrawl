@@ -101,9 +101,3 @@ func TestHostsAreIndependent(t *testing.T) {
 		t.Fatalf("unknown host gap = %v, want 0", g)
 	}
 }
-
-func TestHostKey(t *testing.T) {
-	if HostKey("example.com") != "example.com" {
-		t.Fatal("HostKey should be identity")
-	}
-}

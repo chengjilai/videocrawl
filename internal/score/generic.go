@@ -3,9 +3,9 @@
 package score
 
 // GenericExemplars returns the base reference paragraphs.
-func GenericExemplars() []string { return EXEMPLARS }
+func GenericExemplars() []string { return exemplars }
 
-var EXEMPLARS = []string{
+var exemplars = []string{
 	"A tutorial on Python programming: variables, control flow, functions, classes, generators, decorators and async. Learn how to structure a module, write tests with pytest, and profile your code.",
 	"Understanding the Linux kernel: process scheduling, virtual memory, page tables, syscalls, interrupts, eBPF tracing, and how to read kernel source and write device drivers.",
 	"Algorithm design and analysis: complexity bounds, divide and conquer, dynamic programming, graph algorithms, sorting, hashing, data structures, and how to prove correctness of an implementation.",

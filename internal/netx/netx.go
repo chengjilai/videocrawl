@@ -3,12 +3,12 @@
 // Dial modes:
 //   - ""        plain HTTPS (direct).
 //   - "proxy"   through the smart-proxy (VIDEOCRAWL_PROXY; the verified
-//               WARP-routed path for youtube/archive.org etc.).
+//     WARP-routed path for youtube/archive.org etc.).
 //   - "warp-doh" DoH-resolve the host (Tencent doh.pub — CN-reachable, real
-//               IPs where system DNS is poisoned) then connect via the WARP
-//               SOCKS5 proxy on 127.0.0.1:40000. Needed for media.ccc.de:
-//               its DNS is poisoned locally and the smart-proxy's policy does
-//               not cover it (verified: WARP can reach ccc's real IP).
+//     IPs where system DNS is poisoned) then connect via the WARP
+//     SOCKS5 proxy on 127.0.0.1:40000. Needed for media.ccc.de:
+//     its DNS is poisoned locally and the smart-proxy's policy does
+//     not cover it (verified: WARP can reach ccc's real IP).
 package netx
 
 import (
@@ -39,10 +39,9 @@ const (
 )
 
 // Client builds an http.Client for a site with the given dial mode and
-// proxy URL (used when mode is "proxy").
-// Client builds an http.Client. timeout=0 disables the total request
-// timeout (needed for large file downloads; dial/TLS keep their own
-// timeouts via the transport).
+// proxy URL (used when mode is "proxy"). timeout=0 disables the total
+// request timeout (needed for large file downloads; dial/TLS keep their
+// own timeouts via the transport).
 func Client(dial, proxyURL string, timeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		MaxIdleConns:        64,

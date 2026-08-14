@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -38,7 +37,7 @@ type App struct {
 }
 
 func Default() *App {
-	home, _ := os.UserHomeDir()
+	home := mustHome()
 	db := envOr("VIDEOCRAWL_DB", home+"/videocrawl.db")
 	out := envOr("VIDEOCRAWL_OUT", home+"/Videos/Crawl")
 	return &App{
@@ -83,12 +82,9 @@ func (a *App) Add(kind, raw, name, query, topics string) error {
 	return nil
 }
 
-// SetTopics updates a source's topic filter (” clears it). The next
-// enumeration applies it to new entries; existing queued rows are not
-// retroactively filtered (rm + re-add to rebuild a queue).
 // loadCorpus reads the desired-talk reference (config/semantic-corpus.json)
-// and merges the generic exemplar base. Returns nil when the file is
-// missing — the semantic gate then stays off (keyword/exclusion gates only).
+// and merges the generic exemplar base. When the file is missing, the
+// generic exemplar base alone is used (the semantic gate always runs).
 func (a *App) loadCorpus() []string {
 	path := os.Getenv("VIDEOCRAWL_CORPUS")
 	if path == "" {
@@ -106,6 +102,9 @@ func (a *App) loadCorpus() []string {
 	return corpus
 }
 
+// SetTopics updates a source's topic filter (” clears it). The next
+// enumeration applies it to new entries; existing queued rows are not
+// retroactively filtered (rm + re-add to rebuild a queue).
 func (a *App) SetTopics(id int64, topics string) error {
 	st, err := a.open()
 	if err != nil {
@@ -728,8 +727,7 @@ func (a *App) uploadOne(st *store.Store, v model.Video, src model.Source, pathPr
 	desc := uploadDesc(v, subFileNextTo(path, v.VideoID))
 	script := a.UploadScript
 	if script == "" {
-		home, _ := os.UserHomeDir()
-		script = filepath.Join(home, "src", "bilibili", "upload_web.py")
+		script = filepath.Join(mustHome(), "src", "bilibili", "upload_web.py")
 	}
 	if _, err := os.Stat(script); err != nil {
 		return fmt.Errorf("uploader script %s: %v", script, err)
@@ -942,6 +940,9 @@ func (a *App) List(status string, jsonOut bool, limit int) error {
 	return nil
 }
 
+// trunc truncates s to n runes TOTAL, ellipsis included (n-1 runes + "…").
+// Behavior is pinned by TestTrunc; the post-loop's truncStr (post.go) is the
+// n-runes-plus-ellipsis variant.
 func trunc(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
@@ -949,21 +950,3 @@ func trunc(s string, n int) string {
 	}
 	return string(r[:n-1]) + "…"
 }
-
-// Flag helpers for subcommands.
-type FlagSet struct{ *flag.FlagSet }
-
-func (f *FlagSet) Int(name string, def int, usage string) *int {
-	return f.FlagSet.Int(name, def, usage)
-}
-func (f *FlagSet) Str(name, def, usage string) *string {
-	return f.FlagSet.String(name, def, usage)
-}
-func (f *FlagSet) Bool(name string, def bool, usage string) *bool {
-	return f.FlagSet.Bool(name, def, usage)
-}
-func (f *FlagSet) Int64(name string, def int64, usage string) *int64 {
-	return f.FlagSet.Int64(name, def, usage)
-}
-
-var _ = flag.NewFlagSet

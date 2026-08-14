@@ -288,22 +288,12 @@ func (s *Store) UpsertMediaFiles(srcID int64, videoID string, files []model.Medi
 	return tx.Commit()
 }
 
-// UpdateTitle fills in title/date discovered later (e.g. bilibili flat mode
-// returns empty titles).
-func (s *Store) UpdateTitle(srcID int64, videoID, title, published, channel string) error {
-	_, err := s.db.Exec(
-		`UPDATE videos SET title=?, published=?, channel=? WHERE source_id=? AND video_id=?`,
-		title, published, channel, srcID, videoID)
-	return err
-}
-
 // NextForDownload returns up to n videos ready to process, oldest published
 // first (TubeSync lesson: oldest-first so a slow queue doesn't starve old
-// videos; also makes the crawl time-unbiased).
-// NextForDownload picks the next batch, oldest-published first. minDur/maxDur
-// (seconds; 0 = unset) pre-filter on the KNOWN duration so videos that would
-// only be skipped later don't burn queue/limit slots. duration=0 (unknown)
-// always passes.
+// videos; also makes the crawl time-unbiased). minDur/maxDur (seconds;
+// 0 = unset) pre-filter on the KNOWN duration so videos that would only be
+// skipped later don't burn queue/limit slots. duration=0 (unknown) always
+// passes.
 func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, error) {
 	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at
 		 FROM videos WHERE status IN ('new','failed') AND attempts < 5`

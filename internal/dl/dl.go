@@ -197,7 +197,7 @@ func (p *Pool) process(v model.Video) error {
 
 	// 2. download
 	cmd := yt.DownloadCmd(cfg.Cookies, proxy, p.outDir, cfg.MaxHeight, cfg.AudioFormat, cfg.DLArgs, v.URL)
-	if err := yt.RunDownload(cmd, nil); err != nil {
+	if err := yt.RunDownload(cmd); err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, err.Error())
 		return err
 	}

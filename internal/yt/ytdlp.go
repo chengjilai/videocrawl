@@ -199,11 +199,10 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat strin
 	return exec.Command(Bin(), args...)
 }
 
-// RunDownload runs the download, streaming output lines through logf.
-func RunDownload(cmd *exec.Cmd, logf func(string)) error {
+// RunDownload runs the download, capturing stderr for the error message.
+func RunDownload(cmd *exec.Cmd) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	// progress to stderr in non-tty mode; we just capture the tail
 	err := cmd.Run()
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
@@ -212,12 +211,8 @@ func RunDownload(cmd *exec.Cmd, logf func(string)) error {
 		}
 		return fmt.Errorf("%s", firstLine(msg))
 	}
-	_ = logf
 	return nil
 }
-
-// Now ISO timestamp helper.
-func Now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // ParseUploadDate converts YYYYMMDD to RFC3339 date ("" on empty).
 func ParseUploadDate(s string) string {

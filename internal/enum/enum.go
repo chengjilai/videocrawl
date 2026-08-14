@@ -233,8 +233,6 @@ func enumCCC(srcURL, query string, cfg sites.Site, limit int, onEntry func(Entry
 		if resp.StatusCode != 200 {
 			return 0, false, fmt.Errorf("ccc %d", resp.StatusCode)
 		}
-		var c cccEvent
-		// the conference endpoint returns {events:[...]} — reuse cccPage
 		var pg cccPage
 		if err := json.Unmarshal(b, &pg); err != nil {
 			return 0, false, err
@@ -249,7 +247,6 @@ func enumCCC(srcURL, query string, cfg sites.Site, limit int, onEntry func(Entry
 			}
 			n++
 		}
-		_ = c
 		return n, true, nil
 	}
 	// events list with search: /public/events/search?q=...&page=N
@@ -614,11 +611,4 @@ func httpClient(cfg sites.Site) *http.Client {
 		dial = "proxy"
 	}
 	return netx.Client(dial, sites.ProxyURL(cfg), 90*time.Second)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -64,8 +64,8 @@ func TestDurationSeconds(t *testing.T) {
 		{int64(42), 42},
 		{int(42), 42},
 		{nil, 0},
-		{"42", 0},   // json string durations aren't handled
-		{true, 0},   // default branch
+		{"42", 0}, // json string durations aren't handled
+		{true, 0}, // default branch
 		{[]int{1}, 0},
 	}
 	for _, c := range cases {

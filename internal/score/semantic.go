@@ -114,22 +114,9 @@ func (s *SemanticScorer) vector(text string) map[string]float64 {
 // no idf are skipped during counting, the weighted map is normalized in
 // place, and the dot product accumulates directly — same arithmetic, far
 // fewer intermediate allocations. Tokenization is a hand-rolled scanner
-// (the regexp engine dominated the per-article cost). Score lowercases the
-// input itself; callers that already hold the lowercased text should use
-// ScoreLow to skip the redundant O(n) copy.
+// (the regexp engine dominated the per-call cost).
 func (s *SemanticScorer) Score(text string) float64 {
-	return s.ScoreLow(strings.ToLower(text))
-}
-
-// ScoreLow returns the cosine similarity of an ALREADY-LOWERCASED text
-// against the exemplar centroid. The arithmetic is identical to Score, and
-// because ToLower is idempotent ScoreLow(ToLower(t)) matches Score(t) to
-// within one last-ULP (the final dot product sums a Go map, whose iteration
-// order varies per call — far below the 1e-9 Python-equivalence tolerance).
-// It exists so the per-article path can lowercase the article body once and
-// share it between relevance and semantic scoring instead of copying the
-// full body a second time.
-func (s *SemanticScorer) ScoreLow(low string) float64 {
+	low := strings.ToLower(text)
 	weighted := make(map[string]float64, 64)
 	n := len(low)
 	for i := 0; i < n; {

@@ -266,13 +266,9 @@ func (c *Gallica) getBytesN(ctx context.Context, u string, headers map[string]st
 	return nil, lastErr
 }
 
-// getTo streams a (possibly large) response body to dest, with the same
+// getToN streams a (possibly large) response body to dest, with the same
 // retry/backoff/politeness policy as getBytes. dest is truncated on each
 // attempt so a failed attempt never leaves a half-old file behind.
-func (c *Gallica) getTo(ctx context.Context, u, dest string) error {
-	return c.getToN(ctx, u, dest, c.MaxTries)
-}
-
 func (c *Gallica) getToN(ctx context.Context, u, dest string, tries int) error {
 	var lastErr error
 	for try := 0; try < tries; try++ {

@@ -423,8 +423,6 @@ func archiveClient() *http.Client {
 
 // ---------------------------------------------------------------------------
 // commands
-// ---------------------------------------------------------------------------
-// commands
 
 func PostLoop(args []string) error {
 	fs := flag.NewFlagSet("post-loop", flag.ExitOnError)
@@ -832,6 +830,10 @@ func labelSuffix(label string) string {
 	return ""
 }
 
+// truncStr truncates to n runes and appends an ellipsis (n+1 runes total).
+// Deliberately distinct from trunc (app.go), which keeps the TOTAL length at
+// n runes (n-1 + "…"): both are display helpers with different boundary
+// semantics, and trunc's exact behavior is pinned by TestTrunc.
 func truncStr(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
@@ -840,6 +842,11 @@ func truncStr(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
+// sanitizeName replaces path-hostile characters with '_' for the music
+// post-loop's staging filenames. Note the char set differs from dl.sanitize
+// (which also maps apostrophes but not tabs/newlines) — archive.org track
+// names keep apostrophes here, and merging the two would change produced
+// filenames.
 func sanitizeName(s string) string {
 	s = strings.Map(func(r rune) rune {
 		switch r {
