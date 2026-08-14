@@ -310,6 +310,13 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	case model.KindGallica:
 		return p.processGallica(v, src, cfg)
 	}
+	// ccc may route via the site proxy (smart-proxy/tunnel — machine-
+	// agnostic) when one is configured; warp-doh direct is the fallback.
+	dial := cfg.Dial
+	if dial == "" || sites.ProxyURL(cfg) != "" {
+		dial = "proxy"
+	}
+	client := netx.Client(dial, sites.ProxyURL(cfg), 0) // no total timeout: large files
 	files, err := p.store.GetFiles(v.SourceID, v.VideoID)
 	if err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "files: "+err.Error())
@@ -345,13 +352,6 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		p.store.MarkSkipped(v.SourceID, v.VideoID, "no video recording")
 		return errSkipped
 	}
-	// ccc may route via the site proxy (smart-proxy/tunnel — machine-
-	// agnostic) when one is configured; warp-doh direct is the fallback.
-	dial := cfg.Dial
-	if dial == "" || sites.ProxyURL(cfg) != "" {
-		dial = "proxy"
-	}
-	client := netx.Client(dial, sites.ProxyURL(cfg), 0) // no total timeout: large files
 	channel := sanitize(v.Channel)
 	if channel == "" {
 		channel = "unknown"
