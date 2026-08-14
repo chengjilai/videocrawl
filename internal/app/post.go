@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -185,7 +186,12 @@ func normalizeTitle(t string) string {
 }
 
 // existingBiliTitles lists the account's published video titles (best-effort;
-// empty on API failure).
+// empty on API failure). The member /x/web/archives endpoint returns
+// data.archives=null since 2026-08 (shape change), so this walks the
+// web-dynamic space feed (the same API read_post.py uses) with the
+// upload session cookie, paginated by the response offset.
+var reDedeUserID = regexp.MustCompile(`DedeUserID=(\d+)`)
+
 func existingBiliTitles() map[string]bool {
 	out := map[string]bool{}
 	sess, err := os.ReadFile("/run/secrets/bili-upload-web.json")
@@ -201,66 +207,64 @@ func existingBiliTitles() map[string]bool {
 	if json.Unmarshal(sess, &js) != nil || js.Cookie == "" {
 		return out
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://member.bilibili.com/x/web/archives?pn=1&ps=100&status=all", nil)
-	if err != nil {
+	uid := ""
+	if m := reDedeUserID.FindStringSubmatch(js.Cookie); len(m) > 1 {
+		uid = m[1]
+	}
+	if uid == "" {
 		return out
 	}
-	req.Header.Set("Cookie", js.Cookie)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return out
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return out
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	var d struct {
-		Data struct {
-			Archives []struct {
-				Title string `json:"title"`
-			} `json:"archives"`
-		} `json:"data"`
-	}
-	if json.Unmarshal(body, &d) != nil {
-		return out
-	}
-	for _, a := range d.Data.Archives {
-		out[normalizeTitle(a.Title)] = true
-	}
-	// paginate: the account already exceeds 50 videos, older titles are the
-	// dup risk — keep walking pages until one comes back empty.
-	for pn := 2; len(d.Data.Archives) > 0 && pn < 20; pn++ {
-		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://member.bilibili.com/x/web/archives?pn=%d&ps=100&status=all", pn), nil)
+	offset := ""
+	for page := 0; page < 10; page++ {
+		req, err := http.NewRequest(http.MethodGet,
+			"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid="+uid+
+				"&offset="+url.QueryEscape(offset)+"&timezone_offset=-480", nil)
+		if err != nil {
+			break
+		}
 		req.Header.Set("Cookie", js.Cookie)
 		req.Header.Set("User-Agent", "Mozilla/5.0")
+		req.Header.Set("Referer", "https://www.bilibili.com/")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			break
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
-		var pg struct {
+		var d struct {
 			Data struct {
-				Archives []struct {
-					Title string `json:"title"`
-				} `json:"archives"`
+				Items []struct {
+					Modules struct {
+						ModuleDynamic struct {
+							Major struct {
+								Archive struct {
+									Title string `json:"title"`
+								} `json:"archive"`
+							} `json:"major"`
+						} `json:"module_dynamic"`
+					} `json:"modules"`
+				} `json:"items"`
+				Offset  string `json:"offset"`
+				HasMore bool   `json:"has_more"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(body, &pg) != nil {
+		if json.Unmarshal(body, &d) != nil {
 			break
 		}
-		d = pg
-		for _, a := range d.Data.Archives {
-			out[normalizeTitle(a.Title)] = true
+		n := 0
+		for _, it := range d.Data.Items {
+			if t := it.Modules.ModuleDynamic.Major.Archive.Title; t != "" {
+				out[normalizeTitle(t)] = true
+				n++
+			}
 		}
+		if n == 0 || d.Data.Offset == "" || !d.Data.HasMore {
+			break
+		}
+		offset = d.Data.Offset
 	}
 	return out
 }
-
-// ---------------------------------------------------------------------------
-// video building + upload (same logic as musget's post.go)
 
 func buildVideo(ctx context.Context, audio []string, outPath, line1, line2, line3 string) error {
 	if len(audio) == 0 {
