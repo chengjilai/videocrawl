@@ -152,6 +152,11 @@ func GetMeta(extra []string, cookies, proxy, url string) (*MetaEntry, error) {
 }
 
 // DownloadCmd builds the per-video download command. Recipe from research:
+// DASH-only (bv+ba, NO '/b' fallback): the combined muxed format (18) is
+// served truncated/403 through the WARP egress — the Erik Meijer GOTO 2012
+// download came back as a 1.5MB stub (declared h264+aac, ~0 real frames)
+// that bilibili's transcode rejected (缺少视频轨). DASH streams (134+140)
+// download fully through the same path.
 // 720p H.264 mp4 archive-grade, unique per-video output path (id kills
 // title collisions), .part temp on the same filesystem, resume, en subs.
 // With audioFormat != "" the download is audio-only: -x extracts the best
@@ -184,12 +189,12 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat strin
 		args = append(args, "-x", "--audio-format", audioFormat, "--audio-quality", "0")
 		args = append(args, "-f", "ba/b")
 	case maxHeight > 0:
-		f := fmt.Sprintf("bv*[height<=%d]+ba/b", maxHeight)
+		f := fmt.Sprintf("bv[height<=%d]+ba", maxHeight)
 		args = append(args, "-f", f)
 		args = append(args, "-S", "vcodec:h264,res:720,fps,hdr:12,acodec:m4a")
 		args = append(args, "--merge-output-format", "mp4", "--remux-video", "mp4")
 	default:
-		args = append(args, "-f", "bv*+ba/b")
+		args = append(args, "-f", "bv+ba")
 		args = append(args, "--merge-output-format", "mp4")
 	}
 	if cookies != "" {
