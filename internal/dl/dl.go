@@ -247,6 +247,16 @@ func (p *Pool) process(v model.Video) error {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "output locate: "+err.Error())
 		return fmt.Errorf("output locate: %w", err)
 	}
+	// 3a. truncation guard: the file must carry real data for its declared
+	// duration (≥5 KB/s — healthy 360p is ~25 KB/s). A truncated stub
+	// (GOTO 2012 Erik Meijer: 1.5 MB "for" 51 min) otherwise passes
+	// findOutput, gets uploaded, and bilibili's transcode fails with
+	// "没有音轨". Unknown duration = skip the check (pass).
+	if v.Duration > 0 && size < int64(v.Duration)*5*1024 {
+		p.store.MarkFailed(v.SourceID, v.VideoID,
+			fmt.Sprintf("truncated download: %d bytes for %ds", size, v.Duration))
+		return fmt.Errorf("truncated download: %d bytes for %ds", size, v.Duration)
+	}
 	// 3b. transcript relevance gate: video + subs are on disk now. Missing
 	// transcript = pass; a transcript scoring below the threshold skips.
 	// The score is recorded on MarkDownloaded (0 when no transcript).
