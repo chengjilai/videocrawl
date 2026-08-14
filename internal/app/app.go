@@ -100,24 +100,41 @@ func (a *App) SetTopics(id int64, topics string) error {
 
 // topicFilter compiles a source's topics into a matcher. A topic matches
 // when it appears case-insensitively in the entry title OR channel. Any
-// topic matching keeps the entry (OR semantics). Empty topics = keep all —
-// the techcrawl-go-style curation is: pick good seeds AND, when a seed is
-// broad (whole-instance PeerTube), gate by topic here.
+// topic matching keeps the entry (OR semantics); a topic prefixed with '-'
+// EXCLUDES the entry when it matches (e.g. "-how to,-switch" drops
+// beginner tutorials). Empty topics = keep all — the techcrawl-go-style
+// curation is: pick good seeds AND gate by topic here.
 func topicFilter(topics string) func(e enum.Entry) bool {
 	if strings.TrimSpace(topics) == "" {
 		return nil
 	}
-	var kws []string
+	var kws, neg []string
 	for _, k := range strings.Split(topics, ",") {
-		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
-			kws = append(kws, k)
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
 		}
+		if strings.HasPrefix(k, "-") {
+			if k = strings.TrimPrefix(k, "-"); k != "" {
+				neg = append(neg, k)
+			}
+			continue
+		}
+		kws = append(kws, k)
 	}
-	if len(kws) == 0 {
+	if len(kws) == 0 && len(neg) == 0 {
 		return nil
 	}
 	return func(e enum.Entry) bool {
 		t := strings.ToLower(e.Title + " " + e.Channel)
+		for _, k := range neg {
+			if strings.Contains(t, k) {
+				return false
+			}
+		}
+		if len(kws) == 0 {
+			return true
+		}
 		for _, k := range kws {
 			if strings.Contains(t, k) {
 				return true
