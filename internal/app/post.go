@@ -29,12 +29,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"videocrawl/internal/dl"
@@ -507,7 +509,10 @@ func PostLoop(args []string) error {
 		return nil
 	}
 
-	ctx := context.Background()
+	// SIGINT/SIGTERM must stop the loop (main.go's rootCtx is not wired to
+	// the post-loop; without this, only SIGKILL works).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	for round := 0; ; round++ {
 		if round > 0 && *every <= 0 {
 			break

@@ -48,9 +48,15 @@ case "${1:-}" in
     echo "started pid $(cat "$LOOP_PIDFILE") → $LOG"
     ;;
   stop)
-    [ -f "$LOOP_PIDFILE" ] && kill "$(cat "$LOOP_PIDFILE")" 2>/dev/null && rm -f "$LOOP_PIDFILE"
-    pkill -f 'music-upload-loop' 2>/dev/null
-    echo stopped
+    # pidfile only — a pkill -f 'music-upload-loop' would match this very
+    # script's cmdline and kill itself (the start-upload-loop.sh [.] lesson).
+    if [ -f "$LOOP_PIDFILE" ]; then
+      kill "$(cat "$LOOP_PIDFILE")" 2>/dev/null
+      rm -f "$LOOP_PIDFILE"
+      echo stopped
+    else
+      echo "not running (no pidfile)"
+    fi
     ;;
   loop)
     while true; do round >> "$LOG" 2>&1; sleep 1500; done
