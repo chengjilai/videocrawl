@@ -538,9 +538,15 @@ func parseUploadAllowlist(spec string) (*uploadGate, error) {
 			g.sites["ccc"] = true
 			continue
 		}
+		if tok == "pt" {
+			// peertube sources: trust-at-seed (curated tech channels on
+			// tilvids etc.); the topics filter gates content on top.
+			g.sites["peertube"] = true
+			continue
+		}
 		id, err := strconv.ParseInt(tok, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("--upload-allowlist: unknown token %q (want 'cc' or source ids)", tok)
+			return nil, fmt.Errorf("--upload-allowlist: unknown token %q (want 'cc', 'pt' or source ids)", tok)
 		}
 		g.ids[id] = true
 	}
