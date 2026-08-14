@@ -156,6 +156,10 @@ func GetMeta(extra []string, cookies, proxy, url string) (*MetaEntry, error) {
 // title collisions), .part temp on the same filesystem, resume, en subs.
 // With audioFormat != "" the download is audio-only: -x extracts the best
 // audio (--audio-quality 0 = best), converted to the requested format.
+// Subs: --write-subs (manual/uploader captions, incl. PeerTube .en.vtt)
+// + --write-auto-subs (auto-generated). On YouTube manual subs land as
+// <id>.en.srt and auto as <id>.en-orig.srt; the transcript gate below
+// prefers the longest id-prefixed sub file of the two.
 func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat string, extra []string, url string) *exec.Cmd {
 	args := []string{
 		"--no-playlist",
@@ -165,7 +169,7 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat strin
 		"--restrict-filenames",
 		"-P", "temp:" + outDir + "/.tmp",
 		"-P", "home:" + outDir,
-		"--write-auto-subs", "--sub-langs", "en.*", "--sub-format", "srt/best",
+		"--write-subs", "--write-auto-subs", "--sub-langs", "en.*", "--sub-format", "srt/best",
 		"--concurrent-fragments", "8",
 		"--max-filesize", "4G",
 		"--retry-sleep", "fragment:exp=1:10",

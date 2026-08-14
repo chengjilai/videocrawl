@@ -31,8 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"videocrawl/internal/sites"
 )
 
@@ -140,7 +138,7 @@ func biliSignWbi(params url.Values, mk string) url.Values {
 
 // biliBuvid3: device cookie, yt-dlp's format "<uuid>infoc".
 func biliBuvid3() string {
-	return uuid.New().String() + "infoc"
+	return uuidv4() + "infoc"
 }
 
 // biliCookieHeader reads a Netscape cookies.txt (the bilibili.txt the yt-dlp

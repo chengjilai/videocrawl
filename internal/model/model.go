@@ -51,6 +51,9 @@ type Video struct {
 	SHA256    string
 	BVID      string // bilibili video id after upload
 	FetchedAt string
+	// TranscriptScore: semantic relevance of the downloaded transcript
+	// against the reference corpus (0 = no transcript / unscored).
+	TranscriptScore float64
 }
 
 // Statuses.

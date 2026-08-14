@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go, static binary
+	_ "github.com/ncruces/go-sqlite3/driver" // pure-Go (wasm-derived), static binary
 
 	"videocrawl/internal/model"
 )
@@ -19,11 +19,11 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // modernc sqlite: single writer, avoid SQLITE_BUSY
+	db.SetMaxOpenConns(1) // sqlite: single writer, avoid SQLITE_BUSY
 	s := &Store{db: db}
 	if err := s.init(); err != nil {
 		return nil, err
@@ -106,6 +106,11 @@ func (s *Store) init() error {
 	// CREATE TABLE IF NOT EXISTS never touches existing tables, so add the
 	// column explicitly when an old DB is opened (guard: only when missing).
 	if err := s.ensureColumn("videos", "bvid", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	// migration: transcript_score (relevance gate) postdates the original
+	// schema too; default 0 = unscored/no transcript.
+	if err := s.ensureColumn("videos", "transcript_score", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
 	if err := s.ensureColumn("sources", "topics", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -295,7 +300,7 @@ func (s *Store) UpsertMediaFiles(srcID int64, videoID string, files []model.Medi
 // skipped later don't burn queue/limit slots. duration=0 (unknown) always
 // passes.
 func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, error) {
-	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score
 		 FROM videos WHERE status IN ('new','failed') AND attempts < 5`
 	var args []any
 	if minDur > 0 || maxDur > 0 {
@@ -322,7 +327,7 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -335,7 +340,7 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 // content leaves the frontier first).
 func (s *Store) NextForUpload(n int) ([]model.Video, error) {
 	rows, err := s.db.Query(
-		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at
+		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score
 		 FROM videos WHERE status=? ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`,
 		model.StatusDone, n)
 	if err != nil {
@@ -347,7 +352,7 @@ func (s *Store) NextForUpload(n int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -383,7 +388,7 @@ func (s *Store) CountByStatus() (map[string]int64, error) {
 
 // VideoRows lists videos filtered by status ("" = all).
 func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
-	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at FROM videos`
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score FROM videos`
 	var args []any
 	if status != "" {
 		q += ` WHERE status=?`
@@ -401,7 +406,7 @@ func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -421,9 +426,9 @@ func (s *Store) UpdateMeta(srcID int64, videoID, title string, duration int64, p
 // MarkDownloaded records a successful download.
 func (s *Store) MarkDownloaded(v model.Video) error {
 	_, err := s.db.Exec(
-		`UPDATE videos SET status=?, title=?, duration=?, published=?, channel=?, size_bytes=?, path=?, sha256=?, attempts=attempts+1, last_error='', fetched_at=? WHERE source_id=? AND video_id=?`,
+		`UPDATE videos SET status=?, title=?, duration=?, published=?, channel=?, size_bytes=?, path=?, sha256=?, transcript_score=?, attempts=attempts+1, last_error='', fetched_at=? WHERE source_id=? AND video_id=?`,
 		model.StatusDone, v.Title, v.Duration, v.Published, v.Channel, v.SizeBytes,
-		v.Path, v.SHA256, time.Now().UTC().Format(time.RFC3339), v.SourceID, v.VideoID)
+		v.Path, v.SHA256, v.TranscriptScore, time.Now().UTC().Format(time.RFC3339), v.SourceID, v.VideoID)
 	return err
 }
 

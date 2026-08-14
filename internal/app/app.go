@@ -528,7 +528,7 @@ func (a *App) Download(ctx context.Context, limit, workers int, policy dl.Policy
 		return err
 	}
 	defer st.Close()
-	pool := dl.NewPool(st, a.sites(), a.OutDir, policy, workers)
+	pool := dl.NewPool(st, a.sites(), a.OutDir, policy, workers, dl.WithCorpus(a.loadCorpus()))
 	if err := pool.Run(ctx, limit, deadline); err != nil {
 		return err
 	}

@@ -148,6 +148,7 @@ func TestMarkTransitions(t *testing.T) {
 	upd := model.Video{
 		SourceID: 7, VideoID: "x", Title: "T", Duration: 120,
 		Published: "2024-01-01", Channel: "C", SizeBytes: 99, Path: "/p/x.mp4", SHA256: "deadbeef",
+		TranscriptScore: 0.42,
 	}
 	if err := s.MarkDownloaded(upd); err != nil {
 		t.Fatal(err)
@@ -161,6 +162,9 @@ func TestMarkTransitions(t *testing.T) {
 	}
 	if v.SizeBytes != 99 || v.Path != "/p/x.mp4" || v.SHA256 != "deadbeef" {
 		t.Errorf("after MarkDownloaded: file %+v", v)
+	}
+	if v.TranscriptScore != 0.42 {
+		t.Errorf("after MarkDownloaded: transcript_score=%v, want 0.42", v.TranscriptScore)
 	}
 	if v.LastError != "" {
 		t.Errorf("last_error not cleared: %q", v.LastError)
@@ -281,7 +285,7 @@ func TestUploadMarked(t *testing.T) {
 func TestBvidMigration(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "old.db")
 	// build a pre-bvid videos table by hand (the original schema)
-	db, err := sql.Open("sqlite", p)
+	db, err := sql.Open("sqlite3", p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,6 +324,14 @@ func TestBvidMigration(t *testing.T) {
 	v := getOne(t, s, 1, "old")
 	if v.Status != model.StatusUploaded || v.BVID != "BV1old123456" {
 		t.Errorf("migrated DB: status=%q bvid=%q", v.Status, v.BVID)
+	}
+	// transcript_score is also migrated (default 0) and writable
+	if err := s.MarkDownloaded(model.Video{SourceID: 1, VideoID: "old", TranscriptScore: 0.7}); err != nil {
+		t.Fatalf("MarkDownloaded on migrated DB: %v", err)
+	}
+	v = getOne(t, s, 1, "old")
+	if v.TranscriptScore != 0.7 {
+		t.Errorf("migrated transcript_score = %v, want 0.7", v.TranscriptScore)
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 
 	"videocrawl/internal/enum"
 	"videocrawl/internal/netx"
+	"videocrawl/internal/score"
 
 	"videocrawl/internal/model"
 	"videocrawl/internal/sites"
@@ -50,13 +51,50 @@ type Pool struct {
 	done    int
 	fail    int
 	skip    int
+	// transcript relevance gate (off unless a corpus is configured):
+	scorer              *score.SemanticScorer
+	transcriptThreshold float64
 	// shared gallica session (altcha PoW solved once per pool)
 	gallicaMu sync.Mutex
 	gallica   *enum.Gallica
 }
 
-func NewPool(st *store.Store, sites map[string]sites.Site, outDir string, policy Policy, workers int) *Pool {
-	return &Pool{store: st, sites: sites, outDir: outDir, policy: policy, workers: workers}
+// Option configures a Pool.
+type Option func(*Pool)
+
+// WithCorpus arms the transcript relevance gate: after a video + subs are
+// on disk, the extracted transcript is scored against the reference corpus
+// (config/semantic-corpus.json + generic exemplars); below the threshold
+// the video is skipped (reason "transcript") instead of marked done. A
+// missing transcript always passes (lenient). Without a corpus the gate is
+// off.
+func WithCorpus(corpus []string) Option {
+	return func(p *Pool) {
+		if len(corpus) > 0 {
+			p.scorer = score.NewSemanticScorer(corpus)
+		}
+	}
+}
+
+// transcriptThreshold: minimum transcript semantic score; below it a
+// downloaded video is skipped. Default 0.15, override
+// VIDEOCRAWL_TRANSCRIPT_THRESHOLD.
+func transcriptThreshold() float64 {
+	t := 0.15
+	if v := os.Getenv("VIDEOCRAWL_TRANSCRIPT_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			t = f
+		}
+	}
+	return t
+}
+
+func NewPool(st *store.Store, sites map[string]sites.Site, outDir string, policy Policy, workers int, opts ...Option) *Pool {
+	p := &Pool{store: st, sites: sites, outDir: outDir, policy: policy, workers: workers, transcriptThreshold: transcriptThreshold()}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 func (p *Pool) Counts() (done, fail, skip int) {
@@ -82,7 +120,7 @@ func (p *Pool) Run(ctx context.Context, limit int, deadline time.Time) error {
 	if limit <= 0 {
 		limit = 1 << 30
 	}
-	// table scan batches: we can't stream directly with modernc sqlite
+	// ncruces/go-sqlite3 (wasm-derived) — pure Go, WAL + pragmas verified identical.
 	// (single conn), so pull small batches and track done via status.
 	totalDone := 0
 	for totalDone < limit {
@@ -209,6 +247,13 @@ func (p *Pool) process(v model.Video) error {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "output locate: "+err.Error())
 		return fmt.Errorf("output locate: %w", err)
 	}
+	// 3b. transcript relevance gate: video + subs are on disk now. Missing
+	// transcript = pass; a transcript scoring below the threshold skips.
+	// The score is recorded on MarkDownloaded (0 when no transcript).
+	tsScore, err := p.gateTranscript(v)
+	if err != nil {
+		return err // errSkipped: marked "transcript" in gateTranscript
+	}
 	hash, err := fileSHA256(path)
 	if err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "hash: "+err.Error())
@@ -229,7 +274,29 @@ func (p *Pool) process(v model.Video) error {
 		Path:      path,
 		SHA256:    hash,
 	}
+	upd.TranscriptScore = tsScore
 	return p.store.MarkDownloaded(upd)
+}
+
+// gateTranscript applies the transcript relevance gate: when a transcript
+// exists on disk and scores below the threshold, the video is marked
+// skipped (reason "transcript") and errSkipped is returned; otherwise it
+// returns the score to record on MarkDownloaded (0 when no transcript or
+// the scorer is off). Missing transcript = pass (lenient).
+func (p *Pool) gateTranscript(v model.Video) (float64, error) {
+	if p.scorer == nil {
+		return 0, nil
+	}
+	text := transcriptText(p.outDir, v.VideoID)
+	if text == "" {
+		return 0, nil
+	}
+	sc := p.scorer.Score(text)
+	if sc < p.transcriptThreshold {
+		p.store.MarkSkipped(v.SourceID, v.VideoID, "transcript")
+		return 0, errSkipped
+	}
+	return sc, nil
 }
 
 // findOutput finds the file whose name starts with the video id (yt-dlp
@@ -367,7 +434,13 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	}
 	base := filepath.Join(dir, v.VideoID+"_"+sanitize(v.Title)+"."+ext)
 	if _, err := os.Stat(base); err == nil {
-		// already downloaded (resume of a prior pass)
+		// already downloaded (resume of a prior pass): re-run the
+		// transcript gate (subs from the earlier pass are on disk); a
+		// missing transcript passes leniently.
+		tsScore, err := p.gateTranscript(v)
+		if err != nil {
+			return err
+		}
 		info, _ := os.Stat(base)
 		hash, herr := fileSHA256(base)
 		if herr != nil {
@@ -376,11 +449,24 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		upd := model.Video{SourceID: v.SourceID, VideoID: v.VideoID, Title: v.Title,
 			Duration: v.Duration, Published: v.Published, Channel: v.Channel,
 			SizeBytes: info.Size(), Path: base, SHA256: hash}
+		upd.TranscriptScore = tsScore
 		return p.store.MarkDownloaded(upd)
 	}
 	if err := fetchStriped(client, videoFile.URL, base+".part", base); err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "fetch: "+err.Error())
 		return fmt.Errorf("fetch %s: %w", videoFile.URL, err)
+	}
+	// subtitles land on disk BEFORE the gate so ccc transcripts are judged
+	// like yt-dlp ones (video + subs complete, then decide).
+	if subFile != nil {
+		subPath := filepath.Join(dir, v.VideoID+"_"+sanitize(v.Title)+"."+subFile.Ext)
+		if _, err := os.Stat(subPath); err != nil {
+			FetchResume(client, subFile.URL, subPath+".part", subPath)
+		}
+	}
+	tsScore, err := p.gateTranscript(v)
+	if err != nil {
+		return err
 	}
 	hash, err := fileSHA256(base)
 	if err != nil {
@@ -390,14 +476,9 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	upd := model.Video{SourceID: v.SourceID, VideoID: v.VideoID, Title: v.Title,
 		Duration: v.Duration, Published: v.Published, Channel: v.Channel,
 		SizeBytes: fileSize(base), Path: base, SHA256: hash}
+	upd.TranscriptScore = tsScore
 	if err := p.store.MarkDownloaded(upd); err != nil {
 		return err
-	}
-	if subFile != nil {
-		subPath := filepath.Join(dir, v.VideoID+"_"+sanitize(v.Title)+"."+subFile.Ext)
-		if _, err := os.Stat(subPath); err != nil {
-			FetchResume(client, subFile.URL, subPath+".part", subPath)
-		}
 	}
 	return nil
 }
