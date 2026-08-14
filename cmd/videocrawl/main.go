@@ -56,12 +56,23 @@ func main() {
 		fs := flag.NewFlagSet("add", flag.ExitOnError)
 		name := fs.String("name", "", "source name")
 		query := fs.String("query", "", "extra query (search kinds)")
+		topics := fs.String("topics", "", "comma-separated title/channel topic filter (only matching entries are queued)")
 		fs.Parse(reorderArgs(args, map[string]bool{}))
 		if fs.NArg() < 2 {
-			err = usageErr("add <kind> <url-or-id> [--name N] [--query Q]")
+			err = usageErr("add <kind> <url-or-id> [--name N] [--query Q] [--topics kw1,kw2]")
 			break
 		}
-		err = a.Add(fs.Arg(0), fs.Arg(1), *name, *query)
+		err = a.Add(fs.Arg(0), fs.Arg(1), *name, *query, *topics)
+	case "set-topics":
+		fs := flag.NewFlagSet("set-topics", flag.ExitOnError)
+		fs.Parse(reorderArgs(args, map[string]bool{}))
+		if fs.NArg() < 2 {
+			err = usageErr("set-topics <source-id> <kw1,kw2,...>")
+			break
+		}
+		var sid int64
+		fmt.Sscan(fs.Arg(0), &sid)
+		err = a.SetTopics(sid, fs.Arg(1))
 	case "rm":
 		fs := flag.NewFlagSet("rm", flag.ExitOnError)
 		fs.Parse(reorderArgs(args, map[string]bool{}))
@@ -140,11 +151,15 @@ func main() {
 func usage() {
 	fmt.Println(`videocrawl — polite time-unbiased video crawler
 
-  add <kind> <url-or-id> [--name N] [--query Q]
+  add <kind> <url-or-id> [--name N] [--query Q] [--topics kw1,kw2]
+      --topics: only queue entries whose title/channel matches a keyword
+      (case-insensitive, OR) — the techcrawl-style topical gate for broad
+      seeds (e.g. a whole PeerTube instance)
       kinds: youtube-channel youtube-playlist bilibili-space bilibili-fav
              peertube-channel peertube-search ccc-conf ccc-search
              archive-query archive-audio rss gallica
   rm <id>                     remove a source (and its queued videos)
+  set-topics <id> kw1,kw2      set a source's topic filter ('' clears)
   enumerate [--concurrency N] [--limit N] [--source ID]
   download  [--limit N] [--workers W] [--min-dur S] [--max-dur S]
             [--skip-shorts] [--skip-live]

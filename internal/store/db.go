@@ -108,6 +108,9 @@ func (s *Store) init() error {
 	if err := s.ensureColumn("videos", "bvid", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
+	if err := s.ensureColumn("sources", "topics", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
 	return nil
 }
 
@@ -139,11 +142,11 @@ func (s *Store) ensureColumn(table, column, decl string) error {
 
 // ---- sources ----
 
-func (s *Store) AddSource(kind, url, query, name string) (int64, error) {
+func (s *Store) AddSource(kind, url, query, name, topics string) (int64, error) {
 	site := siteFor(kind)
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO sources (kind,url,query,name,site,created) VALUES (?,?,?,?,?,?)`,
-		kind, url, query, name, site, time.Now().UTC().Format(time.RFC3339))
+		`INSERT OR IGNORE INTO sources (kind,url,query,name,topics,site,created) VALUES (?,?,?,?,?,?,?)`,
+		kind, url, query, name, topics, site, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return 0, err
 	}
@@ -159,8 +162,14 @@ func (s *Store) AddSource(kind, url, query, name string) (int64, error) {
 	return id, nil
 }
 
+// SetSourceTopics updates a source's topic filter column.
+func (s *Store) SetSourceTopics(id int64, topics string) error {
+	_, err := s.db.Exec(`UPDATE sources SET topics=? WHERE id=?`, topics, id)
+	return err
+}
+
 func (s *Store) ListSources(onlyEnabled bool) ([]model.Source, error) {
-	q := `SELECT id,kind,url,query,name,site,needs_proxy,enabled,last_enum,enum_count,enum_complete,created FROM sources`
+	q := `SELECT id,kind,url,query,name,topics,site,needs_proxy,enabled,last_enum,enum_count,enum_complete,created FROM sources`
 	if onlyEnabled {
 		q += ` WHERE enabled=1`
 	}
@@ -174,7 +183,7 @@ func (s *Store) ListSources(onlyEnabled bool) ([]model.Source, error) {
 	for rows.Next() {
 		var src model.Source
 		if err := rows.Scan(&src.ID, &src.Kind, &src.URL, &src.Query, &src.Name,
-			&src.Site, &src.NeedsProxy, &src.Enabled, &src.LastEnum, &src.EnumCount,
+			&src.Topics, &src.Site, &src.NeedsProxy, &src.Enabled, &src.LastEnum, &src.EnumCount,
 			&src.EnumComplete, &src.Created); err != nil {
 			return nil, err
 		}

@@ -388,7 +388,7 @@ func TestVideoFilesRoundtrip(t *testing.T) {
 func TestSourceCRUD(t *testing.T) {
 	s := newTestStore(t)
 	url := "https://www.youtube.com/playlist?list=UUabcdefghijklmnopqrstuvwx"
-	id, err := s.AddSource(model.KindYoutubeChannel, url, "", "chan")
+	id, err := s.AddSource(model.KindYoutubeChannel, url, "", "chan", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,14 +396,14 @@ func TestSourceCRUD(t *testing.T) {
 		t.Fatalf("first id = %d, want 1", id)
 	}
 	// same URL → dedup to the existing id, no second row
-	id2, err := s.AddSource(model.KindYoutubeChannel, url, "", "renamed")
+	id2, err := s.AddSource(model.KindYoutubeChannel, url, "", "renamed", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id2 != id {
 		t.Fatalf("dedup id = %d, want %d", id2, id)
 	}
-	id3, err := s.AddSource(model.KindRSS, "https://example.com/feed", "", "feed")
+	id3, err := s.AddSource(model.KindRSS, "https://example.com/feed", "", "feed", "")
 	if err != nil {
 		t.Fatal(err)
 	}

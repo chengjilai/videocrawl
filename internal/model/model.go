@@ -24,6 +24,7 @@ type Source struct {
 	URL          string // seed url (kind-specific)
 	Query        string // extra param: peertube search q, ccc search q, archive q
 	Name         string
+	Topics       string // comma-separated title/channel topic filter ('' = no filter)
 	Site         string // site config key: youtube|bilibili|peertube|ccc|archive|rss
 	NeedsProxy   bool   // route enumeration through the proxy
 	Enabled      bool

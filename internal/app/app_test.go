@@ -253,7 +253,7 @@ func uploadTestApp(t *testing.T, kind, url, channel string) (*App, *store.Store,
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srcID, err := st.AddSource(kind, url, "", "test")
+	srcID, err := st.AddSource(kind, url, "", "test", "")
 	if err != nil {
 		t.Fatal(err)
 	}

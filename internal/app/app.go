@@ -61,7 +61,7 @@ func (a *App) sites() map[string]sites.Site { return sites.Load(a.SitesJS) }
 
 // ---- add ----
 
-func (a *App) Add(kind, raw, name, query string) error {
+func (a *App) Add(kind, raw, name, query, topics string) error {
 	url, q, err := normalize(kind, raw, query)
 	if err != nil {
 		return err
@@ -74,12 +74,57 @@ func (a *App) Add(kind, raw, name, query string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := st.AddSource(kind, url, q, name)
+	id, err := st.AddSource(kind, url, q, name, topics)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("added source #%d: %s %s (%s)\n", id, kind, url, name)
 	return nil
+}
+
+// SetTopics updates a source's topic filter (” clears it). The next
+// enumeration applies it to new entries; existing queued rows are not
+// retroactively filtered (rm + re-add to rebuild a queue).
+func (a *App) SetTopics(id int64, topics string) error {
+	st, err := a.open()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.SetSourceTopics(id, topics); err != nil {
+		return err
+	}
+	fmt.Printf("source #%d topics = %q\n", id, topics)
+	return nil
+}
+
+// topicFilter compiles a source's topics into a matcher. A topic matches
+// when it appears case-insensitively in the entry title OR channel. Any
+// topic matching keeps the entry (OR semantics). Empty topics = keep all —
+// the techcrawl-go-style curation is: pick good seeds AND, when a seed is
+// broad (whole-instance PeerTube), gate by topic here.
+func topicFilter(topics string) func(e enum.Entry) bool {
+	if strings.TrimSpace(topics) == "" {
+		return nil
+	}
+	var kws []string
+	for _, k := range strings.Split(topics, ",") {
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
+			kws = append(kws, k)
+		}
+	}
+	if len(kws) == 0 {
+		return nil
+	}
+	return func(e enum.Entry) bool {
+		t := strings.ToLower(e.Title + " " + e.Channel)
+		for _, k := range kws {
+			if strings.Contains(t, k) {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // normalize maps a user-provided seed to a canonical URL + query.
@@ -336,9 +381,13 @@ func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, 
 	if host != "" {
 		lim.Wait(host)
 	}
+	filter := topicFilter(src.Topics)
 	count, complete, err := fn(src.URL, src.Query, cfg, limit, func(e enum.Entry) error {
 		if dl.Expired(ctx, deadline) {
 			return errBudget
+		}
+		if filter != nil && !filter(e) {
+			return nil // out of topic — skip (techcrawl-style topical gate)
 		}
 		if err := st.UpsertVideo(model.Video{
 			SourceID:  src.ID,
