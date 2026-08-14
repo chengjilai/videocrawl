@@ -21,6 +21,10 @@
 //	post-seed ID[:Title] ...      queue music candidates (PD-gated repost)
 //	post-status                   show the music post queue
 //	search <query> [--seed]       archive.org PD music search (find logic)
+//	discover [--limit N] [--query Q]... [--sources yt,hn,ccc]
+//	         [--threshold F] [--topics kw1,-kw2] [--hn-min-points N]
+//	         [--per-query N] [--transcripts N] [--include-known] [--json]
+//	                             corpus-driven discovery of new talks (read-only)
 package main
 
 import (
@@ -128,6 +132,8 @@ func main() {
 		err = app.PostStatus(reorderArgs(args, map[string]bool{}))
 	case "search":
 		err = app.MusicSearch(reorderArgs(args, map[string]bool{"seed": true}))
+	case "discover":
+		err = app.Discover(ctx, reorderArgs(args, map[string]bool{"include-known": true, "json": true}))
 	case "status":
 		err = a.Status()
 	case "list":
@@ -174,6 +180,15 @@ func usage() {
   post-seed ID[:Title] ...     queue music candidates
   post-status                  show the music post queue
   search <query> [--seed]      archive.org PD music search (the music find)
+  discover [--limit N] [--query Q]... [--sources yt,hn,ccc]
+      [--threshold F] [--topics kw1,-kw2] [--hn-min-points N]
+      [--per-query N] [--transcripts N] [--include-known] [--json]
+      corpus-driven discovery of new talks (read-only): queries are
+      generated from the uploaded-talk corpus (config/semantic-corpus.json)
+      and run through youtube search / HN / media.ccc.de; results are gated
+      (dedup, topics, semantic score, shorts/live, speaker boost) and ranked.
+      No DB writes, no downloads — add a hit with
+      'videocrawl add youtube-playlist <url>' (works for a single talk)
   status                      sources + queue counts
   list [--status X] [--json] [--limit N]
 
@@ -197,6 +212,8 @@ examples:
   videocrawl crawl-loop --every 3600 --limit 10 --workers 6 --max-time 3600
   videocrawl upload --upload-allowlist cc,3,7 --path-prefix-rewrite /home/sjtu/Videos/Crawl:/home/chengjilai/Videos/Crawl
   videocrawl search 'collection:78rpm AND mediatype:audio' --seed
+  videocrawl discover --limit 10 --sources yt,ccc
+  videocrawl discover --query 'taming the future shepherd' --sources hn
   videocrawl post-loop --limit 1 --check-bili`)
 }
 

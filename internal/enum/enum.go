@@ -195,12 +195,13 @@ func peerTubeBase(srcURL string) (string, error) {
 // ---- media.ccc.de ----
 
 type cccEvent struct {
-	GUID       string   `json:"guid"`
-	Title      string   `json:"title"`
-	Date       string   `json:"date"`
-	Duration   int64    `json:"duration"`
-	Persons    []string `json:"persons"`
-	Recordings []struct {
+	GUID        string   `json:"guid"`
+	Title       string   `json:"title"`
+	Date        string   `json:"date"`
+	Duration    int64    `json:"duration"`
+	Persons     []string `json:"persons"`
+	Description string   `json:"description"` // abstract, on /public/events/<guid>
+	Recordings  []struct {
 		Filename string `json:"filename"`
 		URL      string `json:"recording_url"`
 		MimeType string `json:"mime_type"`
@@ -611,4 +612,88 @@ func httpClient(cfg sites.Site) *http.Client {
 		dial = "proxy"
 	}
 	return netx.Client(dial, sites.ProxyURL(cfg), 90*time.Second)
+}
+
+// ---- media.ccc.de discover helpers ----
+
+// CCCEvent: public shape of a media.ccc.de event for the discover command.
+type CCCEvent struct {
+	GUID        string
+	Title       string
+	Date        string
+	Duration    int64
+	Persons     []string
+	Description string // abstract, present on /public/events/<guid>
+}
+
+// CCCClient builds the HTTP client for media.ccc.de (same transport rules
+// as the ccc enumerator: configured proxy takes precedence over the
+// warp-doh dial).
+func CCCClient(cfg sites.Site) *http.Client { return httpClient(cfg) }
+
+// CCCSearch queries the event search endpoint and returns the first page
+// of events (capped at limit when > 0).
+func CCCSearch(client *http.Client, query string, limit int) ([]CCCEvent, error) {
+	u := "https://media.ccc.de/public/events/search?q=" + url.QueryEscape(query)
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("ccc search %d", resp.StatusCode)
+	}
+	var pg cccPage
+	if err := json.Unmarshal(b, &pg); err != nil {
+		return nil, err
+	}
+	out := make([]CCCEvent, 0, len(pg.Events))
+	for _, e := range pg.Events {
+		out = append(out, CCCEvent{
+			GUID:        e.GUID,
+			Title:       e.Title,
+			Date:        e.Date,
+			Duration:    e.Duration,
+			Persons:     e.Persons,
+			Description: e.Description,
+		})
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// CCCEventByGUID fetches one event from /public/events/<guid> — the form
+// that carries the abstract in the description field.
+func CCCEventByGUID(client *http.Client, guid string) (*CCCEvent, error) {
+	u := "https://media.ccc.de/public/events/" + url.PathEscape(guid)
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("ccc event %d", resp.StatusCode)
+	}
+	var e cccEvent
+	if err := json.Unmarshal(b, &e); err != nil {
+		return nil, err
+	}
+	return &CCCEvent{
+		GUID:        e.GUID,
+		Title:       e.Title,
+		Date:        e.Date,
+		Duration:    e.Duration,
+		Persons:     e.Persons,
+		Description: e.Description,
+	}, nil
 }

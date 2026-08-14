@@ -31,6 +31,11 @@ var (
 	assOverrideRe = regexp.MustCompile(`\{[^}]*\}`)
 )
 
+// TranscriptText is the exported form of transcriptText (used by the
+// discover command's transcript stage; the download pool uses the private
+// form).
+func TranscriptText(outDir, videoID string) string { return transcriptText(outDir, videoID) }
+
 // transcriptText returns the plain text of the best (longest) id-prefixed
 // subtitle file for videoID, or "" when none exists or none can be read.
 func transcriptText(outDir, videoID string) string {
