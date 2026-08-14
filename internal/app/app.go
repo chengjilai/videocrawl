@@ -25,6 +25,7 @@ import (
 	"videocrawl/internal/enum"
 	"videocrawl/internal/model"
 	"videocrawl/internal/politeness"
+	"videocrawl/internal/score"
 	"videocrawl/internal/sites"
 	"videocrawl/internal/store"
 )
@@ -85,6 +86,26 @@ func (a *App) Add(kind, raw, name, query, topics string) error {
 // SetTopics updates a source's topic filter (” clears it). The next
 // enumeration applies it to new entries; existing queued rows are not
 // retroactively filtered (rm + re-add to rebuild a queue).
+// loadCorpus reads the desired-talk reference (config/semantic-corpus.json)
+// and merges the generic exemplar base. Returns nil when the file is
+// missing — the semantic gate then stays off (keyword/exclusion gates only).
+func (a *App) loadCorpus() []string {
+	path := os.Getenv("VIDEOCRAWL_CORPUS")
+	if path == "" {
+		path = "config/semantic-corpus.json"
+	}
+	corpus := score.GenericExemplars()
+	if data, err := os.ReadFile(path); err == nil {
+		var d struct {
+			Corpus []string `json:"corpus"`
+		}
+		if json.Unmarshal(data, &d) == nil {
+			corpus = append(corpus, d.Corpus...)
+		}
+	}
+	return corpus
+}
+
 func (a *App) SetTopics(id int64, topics string) error {
 	st, err := a.open()
 	if err != nil {
@@ -96,6 +117,24 @@ func (a *App) SetTopics(id int64, topics string) error {
 	}
 	fmt.Printf("source #%d topics = %q\n", id, topics)
 	return nil
+}
+
+// mostlyLatin reports whether ≥ half the letters are ASCII (drops Khmer,
+// Arabic, CJK title floods — the desired corpus is English tech talks).
+func mostlyLatin(s string) bool {
+	letters, latin := 0, 0
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+			letters++
+			latin++
+		} else if r > 127 {
+			letters++
+		}
+	}
+	if letters == 0 {
+		return false
+	}
+	return latin*2 >= letters
 }
 
 // topicFilter compiles a source's topics into a matcher. A topic matches
@@ -399,12 +438,27 @@ func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, 
 		lim.Wait(host)
 	}
 	filter := topicFilter(src.Topics)
+	// semantic gate: score against the desired-talk reference (upload
+	// history + generic exemplars); keep entries above the threshold.
+	scorer := score.NewSemanticScorer(a.loadCorpus())
+	threshold := 0.12
+	if v := os.Getenv("VIDEOCRAWL_SEMANTIC_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			threshold = f
+		}
+	}
 	count, complete, err := fn(src.URL, src.Query, cfg, limit, func(e enum.Entry) error {
 		if dl.Expired(ctx, deadline) {
 			return errBudget
 		}
 		if filter != nil && !filter(e) {
 			return nil // out of topic — skip (techcrawl-style topical gate)
+		}
+		if scorer != nil && scorer.Score(e.Title+" "+e.Channel) < threshold {
+			return nil // semantically unlike the desired corpus — skip
+		}
+		if !mostlyLatin(e.Title + " " + e.Channel) {
+			return nil // non-Latin script (Khmer/Arabic/...) — off-profile
 		}
 		if err := st.UpsertVideo(model.Video{
 			SourceID:  src.ID,
