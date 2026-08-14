@@ -411,6 +411,8 @@ type iaMetadata struct {
 	Title     string         `json:"title"`
 	Mediatype string         `json:"mediatype"`
 	Metadata  map[string]any `json:"metadata"`
+	Server    string         `json:"server"`
+	Dir       string         `json:"dir"`
 	Files     []iaFile       `json:"files"`
 }
 
@@ -466,11 +468,23 @@ func PickAudioFiles(files []iaFile) []iaFile {
 
 var kbRe = regexp.MustCompile(`_\d+kb\.`)
 
-// archiveDownloadURL builds the canonical file URL (https://archive.org/
+// ArchiveDownloadURL builds the canonical file URL (https://archive.org/
 // download/<id>/<name>, subdirs preserved, path-escaped).
 func ArchiveDownloadURL(id, name string) string {
 	u := url.URL{Scheme: "https", Host: "archive.org", Path: "/download/" + id + "/" + name}
 	return u.String()
+}
+
+// ArchiveDirectURL builds the item-node URL (https://<server><dir>/<name>)
+// from the metadata's server+dir fields — skips the /download/ redirect
+// hop (measured ~2.5s vs ~5.2s first byte through the proxy). Falls back
+// to the /download/ redirect URL when the metadata lacked server/dir.
+func ArchiveDirectURL(m *iaMetadata, id, name string) string {
+	if m != nil && m.Server != "" {
+		u := url.URL{Scheme: "https", Host: m.Server, Path: m.Dir + "/" + name}
+		return u.String()
+	}
+	return ArchiveDownloadURL(id, name)
 }
 
 // processArchiveAudio: fetch the item's audio files natively. The primary

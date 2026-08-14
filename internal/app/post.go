@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"videocrawl/internal/dl"
@@ -371,6 +372,7 @@ func PostLoop(args []string) error {
 	seed := fs.String("seed", "", "comma-separated item ids, optional :CustomTitle")
 	checkBili := fs.Bool("check-bili", false, "skip titles already on the account")
 	noUpload := fs.Bool("no-upload", false, "download+encode only (upload from another machine)")
+	jobsN := fs.Int("jobs", 4, "parallel audio downloads")
 	uploadOnly := fs.Bool("upload-only", false, "upload items already staged as videos (state+Videos/Post synced)")
 	state := fs.String("state", defaultStatePath(), "state file")
 	videoDir := fs.String("video-dir", filepath.Join(mustHome(), "Videos", "Post"), "staged video directory")
@@ -408,8 +410,19 @@ func PostLoop(args []string) error {
 
 	if *uploadOnly {
 		uctx := context.Background()
+		// Fail-safe dedup: check-bili returning 0 on an account that already
+		// has posts means the archives API hiccuped (observed 2026-08-14:
+		// '0 existing titles' despite 55 live) — posting blind risks dups
+		// (the Mozart double-post). Skip the round instead.
+		if *checkBili && len(existing) == 0 && len(st.items) > 0 {
+			logf("[check-bili] 0 titles but %d tracked items — API hiccup, skipping round", len(st.items))
+			return nil
+		}
 		n := 0
 		for _, it := range st.items {
+			if n >= *limit {
+				break
+			}
 			if it.Status != "downloaded" || it.BVID != "" {
 				continue
 			}
@@ -473,6 +486,12 @@ func PostLoop(args []string) error {
 		for _, it := range cands {
 			if posted >= *limit {
 				break
+			}
+			if *noUpload && it.Status == "downloaded" {
+				if _, err := os.Stat(filepath.Join(*videoDir, it.ID+".mp4")); err == nil {
+					logf("    already staged, skip")
+					continue
+				}
 			}
 			logf("--- %s (%s)", it.ID, it.Title)
 			ac := archiveClient()
@@ -540,16 +559,40 @@ func PostLoop(args []string) error {
 				st.save()
 				continue
 			}
-			var audioPaths []string
+			var (
+				audioPaths []string
+				mu         sync.Mutex
+				dlFail     string
+				wg         sync.WaitGroup
+				sem        = make(chan struct{}, *jobsN)
+			)
 			for _, f := range files {
-				dest := filepath.Join(workDir, sanitizeName(filepath.Base(f.Name)))
-				if err := dl.FetchResume(ac, dl.ArchiveDownloadURL(it.ID, f.Name), dest+".part", dest); err != nil {
-					it.Status, it.Reason = "failed", fmt.Sprintf("download %s: %v", f.Name, err)
-					logf("    FAIL download %s: %v", f.Name, err)
-					st.save()
-					continue
-				}
-				audioPaths = append(audioPaths, dest)
+				name := f.Name
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					dest := filepath.Join(workDir, sanitizeName(filepath.Base(name)))
+					if err := dl.FetchResume(ac, dl.ArchiveDirectURL(item, it.ID, name), dest+".part", dest); err != nil {
+						mu.Lock()
+						if dlFail == "" {
+							dlFail = fmt.Sprintf("download %s: %v", name, err)
+						}
+						mu.Unlock()
+						return
+					}
+					mu.Lock()
+					audioPaths = append(audioPaths, dest)
+					mu.Unlock()
+				}()
+			}
+			wg.Wait()
+			if dlFail != "" {
+				it.Status, it.Reason = "failed", dlFail
+				logf("    FAIL %s", dlFail)
+				st.save()
+				continue
 			}
 			it.Status = "downloaded"
 			st.save()
@@ -572,6 +615,7 @@ func PostLoop(args []string) error {
 			if *noUpload {
 				logf("    STAGED %s → %s (upload later with --upload-only)", title, out)
 				st.save()
+				posted++
 				continue
 			}
 			tags := "古典音乐,历史录音"
