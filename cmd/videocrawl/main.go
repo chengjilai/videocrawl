@@ -15,6 +15,12 @@
 //	       [--path-prefix-rewrite OLD:NEW]
 //	status
 //	list [--status X] [--json] [--limit N]
+//
+//	post-loop [--every SEC] [--limit N] [--dry-run] [--check-bili]
+//	          [--no-upload|--upload-only] [--seed ID[:T],...] [--proxy URL] [--relay cors.sh|eu.org]
+//	post-seed ID[:Title] ...      queue music candidates (PD-gated repost)
+//	post-status                   show the music post queue
+//	search <query> [--seed]       archive.org PD music search (find logic)
 package main
 
 import (
@@ -104,6 +110,14 @@ func main() {
 		rewrite := fs.String("path-prefix-rewrite", "", "OLD:NEW — rewrite videos.path prefix (lab->aturing sync)")
 		fs.Parse(reorderArgs(args, map[string]bool{"dry-run": true}))
 		err = a.Upload(*limit, *dryRun, *allowlist, *rewrite, a.OutDir)
+	case "post-loop":
+		err = app.PostLoop(reorderArgs(args, map[string]bool{"dry-run": true, "check-bili": true, "no-upload": true, "upload-only": true, "q": true}))
+	case "post-seed":
+		err = app.PostSeed(args)
+	case "post-status":
+		err = app.PostStatus(reorderArgs(args, map[string]bool{}))
+	case "search":
+		err = app.MusicSearch(reorderArgs(args, map[string]bool{"seed": true}))
 	case "status":
 		err = a.Status()
 	case "list":
@@ -138,6 +152,14 @@ func usage() {
   upload [--limit N] [--dry-run] --upload-allowlist 'cc'|IDs [--path-prefix-rewrite OLD:NEW]
       republish done videos to bilibili; --upload-allowlist is mandatory:
       'cc' = media.ccc.de (CC BY) sources, or a comma list of source ids
+  post-loop [--every SEC] [--limit N] [--dry-run] [--check-bili] [--no-upload|--upload-only]
+      [--seed ID[:T],...] [--video-dir DIR]
+      PD-gated auto download+repost loop for music (archive.org → bilibili;
+      law gate: recording year >50y; dedup: ~/.videocrawl/repost-state.jsonl;
+      egress via the archive site config — smart-proxy, same as the crawler)
+  post-seed ID[:Title] ...     queue music candidates
+  post-status                  show the music post queue
+  search <query> [--seed]      archive.org PD music search (the music find)
   status                      sources + queue counts
   list [--status X] [--json] [--limit N]
 
@@ -159,7 +181,9 @@ examples:
   videocrawl add gallica https://gallica.bnf.fr/ark:/12148/btv1b52503827w
   videocrawl add rss https://shipit.show/feed
   videocrawl crawl-loop --every 3600 --limit 10 --workers 6 --max-time 3600
-  videocrawl upload --upload-allowlist cc,3,7 --path-prefix-rewrite /home/sjtu/Videos/Crawl:/home/chengjilai/Videos/Crawl`)
+  videocrawl upload --upload-allowlist cc,3,7 --path-prefix-rewrite /home/sjtu/Videos/Crawl:/home/chengjilai/Videos/Crawl
+  videocrawl search 'collection:78rpm AND mediatype:audio' --seed
+  videocrawl post-loop --limit 1 --check-bili`)
 }
 
 func usageErr(msg string) error { return fmt.Errorf("usage: %s", msg) }

@@ -390,7 +390,7 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	if subFile != nil {
 		subPath := filepath.Join(dir, v.VideoID+"_"+sanitize(v.Title)+"."+subFile.Ext)
 		if _, err := os.Stat(subPath); err != nil {
-			fetchResume(client, subFile.URL, subPath+".part", subPath)
+			FetchResume(client, subFile.URL, subPath+".part", subPath)
 		}
 	}
 	return nil
@@ -405,13 +405,18 @@ type iaFile struct {
 }
 
 // iaMetadata: the parts of the archive.org metadata document we use.
+// Title/Mediatype/Metadata also feed the music post-loop's law gate
+// (internal/app/post.go) — the full /metadata/ doc is unmarshalled.
 type iaMetadata struct {
-	Files []iaFile `json:"files"`
+	Title     string         `json:"title"`
+	Mediatype string         `json:"mediatype"`
+	Metadata  map[string]any `json:"metadata"`
+	Files     []iaFile       `json:"files"`
 }
 
 // archiveMetadata fetches https://archive.org/metadata/{id} through the
 // site's transport (archive site config: smart-proxy).
-func archiveMetadata(client *http.Client, id string) (*iaMetadata, error) {
+func ArchiveMetadata(client *http.Client, id string) (*iaMetadata, error) {
 	u := "https://archive.org/metadata/" + url.PathEscape(id)
 	resp, err := client.Get(u)
 	if err != nil {
@@ -436,7 +441,7 @@ func archiveMetadata(client *http.Client, id string) (*iaMetadata, error) {
 // needle-drop audio where the derived mp3 is the portable republishing
 // format (small files, lossy generation is irrelevant), and the crawler's
 // output feeds a size-bounded upload pipeline.
-func pickAudioFiles(files []iaFile) []iaFile {
+func PickAudioFiles(files []iaFile) []iaFile {
 	for _, tier := range []string{"mp3", "flac", "ogg", "opus", "m4a", "wav", "aac"} {
 		var chosen []iaFile
 		for _, f := range files {
@@ -463,7 +468,7 @@ var kbRe = regexp.MustCompile(`_\d+kb\.`)
 
 // archiveDownloadURL builds the canonical file URL (https://archive.org/
 // download/<id>/<name>, subdirs preserved, path-escaped).
-func archiveDownloadURL(id, name string) string {
+func ArchiveDownloadURL(id, name string) string {
 	u := url.URL{Scheme: "https", Host: "archive.org", Path: "/download/" + id + "/" + name}
 	return u.String()
 }
@@ -478,12 +483,12 @@ func (p *Pool) processArchiveAudio(v model.Video, src model.Source, cfg sites.Si
 		dial = "proxy"
 	}
 	client := netx.Client(dial, sites.ProxyURL(cfg), 0) // no total timeout: large files
-	meta, err := archiveMetadata(client, v.VideoID)
+	meta, err := ArchiveMetadata(client, v.VideoID)
 	if err != nil {
 		p.store.MarkFailed(v.SourceID, v.VideoID, "metadata: "+err.Error())
 		return fmt.Errorf("archive metadata: %w", err)
 	}
-	files := pickAudioFiles(meta.Files)
+	files := PickAudioFiles(meta.Files)
 	if len(files) == 0 {
 		p.store.MarkSkipped(v.SourceID, v.VideoID, "no audio files (flac/mp3/ogg)")
 		return errSkipped
@@ -501,7 +506,7 @@ func (p *Pool) processArchiveAudio(v model.Video, src model.Source, cfg sites.Si
 	primary := files[0]
 	dest := filepath.Join(dir, v.VideoID+"_"+sanitize(title)+"."+strings.ToLower(extOf(primary.Name)))
 	if _, err := os.Stat(dest); err != nil {
-		if err := fetchResume(client, archiveDownloadURL(v.VideoID, primary.Name), dest+".part", dest); err != nil {
+		if err := FetchResume(client, ArchiveDownloadURL(v.VideoID, primary.Name), dest+".part", dest); err != nil {
 			p.store.MarkFailed(v.SourceID, v.VideoID, "fetch: "+err.Error())
 			return fmt.Errorf("fetch %s: %w", primary.Name, err)
 		}
@@ -524,7 +529,7 @@ func (p *Pool) processArchiveAudio(v model.Video, src model.Source, cfg sites.Si
 	for _, f := range files[1:] {
 		ep := filepath.Join(dir, v.VideoID+"_"+sanitize(f.Name))
 		if _, err := os.Stat(ep); err != nil {
-			if err := fetchResume(client, archiveDownloadURL(v.VideoID, f.Name), ep+".part", ep); err != nil {
+			if err := FetchResume(client, ArchiveDownloadURL(v.VideoID, f.Name), ep+".part", ep); err != nil {
 				fmt.Fprintf(os.Stderr, "WARN %s extra %s: %v\n", v.VideoID, f.Name, err)
 				continue
 			}
@@ -536,7 +541,7 @@ func (p *Pool) processArchiveAudio(v model.Video, src model.Source, cfg sites.Si
 		}
 		extras = append(extras, model.MediaFile{
 			SourceID: v.SourceID, VideoID: v.VideoID,
-			URL: archiveDownloadURL(v.VideoID, f.Name),
+			URL:  ArchiveDownloadURL(v.VideoID, f.Name),
 			Path: ep, SHA256: h, SizeBytes: fileSize(ep),
 			Ext: strings.ToLower(extOf(f.Name)),
 		})
@@ -612,7 +617,7 @@ func destLock(dest string) *sync.Mutex {
 // success the tmp file is renamed to dst (atomic). Still used for
 // subtitles (small) and as the single-stream fallback in fetchStriped
 // (no-range servers, small files, probe failures).
-func fetchResume(client *http.Client, url, tmp, dst string) error {
+func FetchResume(client *http.Client, url, tmp, dst string) error {
 	const maxAttempts = 8
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -707,7 +712,7 @@ func nativeConfig() (stripes int, rateCeil int64) {
 func fetchStriped(client *http.Client, url, tmp, dst string) error {
 	total, ranges, err := probeRange(client, url)
 	if err != nil || !ranges || total < nativeSmallFile {
-		return fetchResume(client, url, tmp, dst)
+		return FetchResume(client, url, tmp, dst)
 	}
 	stripes, rateCeil := nativeConfig()
 	// never split into stripes smaller than ~1MiB

@@ -94,7 +94,7 @@ func TestSingleStreamCompareLive(t *testing.T) {
 	tmp := filepath.Join(dir, "test.part")
 	dst := filepath.Join(dir, "test.mp4")
 	start := time.Now()
-	if err := fetchResume(client, url, tmp, dst); err != nil {
+	if err := FetchResume(client, url, tmp, dst); err != nil {
 		t.Fatalf("fetchResume: %v", err)
 	}
 	el := time.Since(start)
