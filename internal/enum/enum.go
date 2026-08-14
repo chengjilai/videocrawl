@@ -195,12 +195,12 @@ func peerTubeBase(srcURL string) (string, error) {
 // ---- media.ccc.de ----
 
 type cccEvent struct {
-	GUID        string `json:"guid"`
-	Title       string `json:"title"`
-	Date        string `json:"date"`
-	Duration    int64  `json:"duration"`
-	Persons     []string `json:"persons"`
-	Recordings  []struct {
+	GUID       string   `json:"guid"`
+	Title      string   `json:"title"`
+	Date       string   `json:"date"`
+	Duration   int64    `json:"duration"`
+	Persons    []string `json:"persons"`
+	Recordings []struct {
 		Filename string `json:"filename"`
 		URL      string `json:"recording_url"`
 		MimeType string `json:"mime_type"`
@@ -214,8 +214,8 @@ type cccPage struct {
 	Events []cccEvent `json:"events"`
 	// conferences list form
 	Conferences []struct {
-		Acronym string `json:"acronym"`
-		Title   string `json:"title"`
+		Acronym string     `json:"acronym"`
+		Title   string     `json:"title"`
 		Events  []cccEvent `json:"events"`
 	} `json:"conferences"`
 }
@@ -427,9 +427,9 @@ type iaSearch struct {
 		NumFound int64 `json:"numFound"`
 		Start    int   `json:"start"`
 		Docs     []struct {
-			Identifier string         `json:"identifier"`
+			Identifier string          `json:"identifier"`
 			Title      json.RawMessage `json:"title"`
-			Date       string         `json:"date"`
+			Date       string          `json:"date"`
 			Creator    json.RawMessage `json:"creator"`
 		} `json:"docs"`
 	} `json:"response"`
@@ -520,9 +520,9 @@ func enumRSS(srcURL, _ string, cfg sites.Site, limit int, onEntry func(Entry) er
 	}
 	// minimal RSS/Atom parse: items with media:content / enclosure / link
 	type item struct {
-		Title   string `xml:"title"`
-		Link    string `xml:"link"`
-		PubDate string `xml:"pubDate"`
+		Title     string `xml:"title"`
+		Link      string `xml:"link"`
+		PubDate   string `xml:"pubDate"`
 		Enclosure struct {
 			URL  string `xml:"url,attr"`
 			Type string `xml:"type,attr"`
@@ -605,6 +605,13 @@ func httpClient(cfg sites.Site) *http.Client {
 		if sites.ProxyURL(cfg) != "" {
 			dial = "proxy"
 		}
+	}
+	// A configured proxy (smart-proxy / lab tunnel) takes precedence over
+	// the warp-doh dial: media.ccc.de is warp-routed by the smart-proxy
+	// (egress policy, f90e10d), and warp-doh dials the LOCAL WARP socks
+	// (127.0.0.1:40000) which only exists on aturing.
+	if p := sites.ProxyURL(cfg); p != "" {
+		dial = "proxy"
 	}
 	return netx.Client(dial, sites.ProxyURL(cfg), 90*time.Second)
 }
