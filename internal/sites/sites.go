@@ -53,8 +53,12 @@ func Defaults() map[string]Site {
 			MaxHeight: 720,
 		},
 		"ccc": {
-			Proxy:     "",         // smart-proxy cannot route it (policy gap)
-			Dial:      "warp-doh", // DoH resolve + WARP socks, verified path
+			// Proxy "auto" since 2026-08-14 (f90e10d): media.ccc.de is in the
+			// egress warp policy, so the smart-proxy routes it — machine-
+			// agnostic (aturing direct, lab via the :18888 tunnel). The
+			// warp-doh dial below stays as the no-proxy fallback path.
+			Proxy:     "auto",
+			Dial:      "warp-doh", // fallback when no proxy is configured
 			MaxHeight: 720,
 		},
 		"archive": {

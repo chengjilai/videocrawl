@@ -317,7 +317,7 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 	}
 	if len(files) == 0 && src.Site == "ccc" {
 		// list endpoint omits recordings: fetch the event detail
-		files, err = cccEventFiles(v.URL, cfg.MaxHeight)
+		files, err = cccEventFiles(client, v.URL, cfg.MaxHeight)
 		if err != nil {
 			p.store.MarkFailed(v.SourceID, v.VideoID, "ccc detail: "+err.Error())
 			return fmt.Errorf("ccc detail: %w", err)
@@ -345,7 +345,13 @@ func (p *Pool) processNative(v model.Video, src model.Source, cfg sites.Site) er
 		p.store.MarkSkipped(v.SourceID, v.VideoID, "no video recording")
 		return errSkipped
 	}
-	client := netx.Client("warp-doh", "", 0) // no total timeout: large files
+	// ccc may route via the site proxy (smart-proxy/tunnel — machine-
+	// agnostic) when one is configured; warp-doh direct is the fallback.
+	dial := cfg.Dial
+	if dial == "" || sites.ProxyURL(cfg) != "" {
+		dial = "proxy"
+	}
+	client := netx.Client(dial, sites.ProxyURL(cfg), 0) // no total timeout: large files
 	channel := sanitize(v.Channel)
 	if channel == "" {
 		channel = "unknown"
@@ -974,8 +980,7 @@ func (l *byteLimiter) wait(n int) {
 
 // cccEventFiles fetches one event's detail and picks video+sub recordings.
 // maxHeight<=480 prefers the sd variants (smaller files; the hd are 4-8x).
-func cccEventFiles(eventURL string, maxHeight int) ([]model.File, error) {
-	client := netx.Client("warp-doh", "", 0) // no total timeout: large files
+func cccEventFiles(client *http.Client, eventURL string, maxHeight int) ([]model.File, error) {
 	resp, err := client.Get(eventURL)
 	if err != nil {
 		return nil, err
