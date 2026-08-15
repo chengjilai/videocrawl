@@ -105,6 +105,20 @@ func loadState(path string) (*postState, error) {
 	return st, nil
 }
 
+// merge unions the fresh file state into s: the more advanced status wins
+// per id (posted > downloaded > queued > failed/rejected), so a reload
+// never resurrects an item the loop already finished — and external
+// post-seed additions land in s.
+func (s *postState) merge(fresh *postState) {
+	rank := map[string]int{"": 0, "rejected": 1, "failed": 2, "queued": 3, "downloaded": 4, "posted": 5}
+	for id, f := range fresh.items {
+		cur := s.items[id]
+		if cur == nil || rank[f.Status] > rank[cur.Status] {
+			s.items[id] = f
+		}
+	}
+}
+
 func (s *postState) save() error {
 	ids := make([]string, 0, len(s.items))
 	for id := range s.items {
@@ -535,6 +549,13 @@ func PostLoop(args []string) error {
 	for round := 0; ; round++ {
 		if round > 0 && *every <= 0 {
 			break
+		}
+		// reload the state each round: save() rewrites the whole file from
+		// memory, so a long-running loop would otherwise clobber external
+		// additions (post-seed writing new items while the loop runs —
+		// observed 2026-08-15: 18 seeded items wiped by the loop's save).
+		if fresh, err := loadState(*state); err == nil {
+			st.merge(fresh)
 		}
 		var cands []*PostItem
 		for _, it := range st.items {
