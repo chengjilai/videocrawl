@@ -1,7 +1,7 @@
 // The embedding-backed scorer: semantic scoring delegated to a local
 // embedding server (VIDEOCRAWL_EMBED_URL — the lab's
 // Qwen3-Embedding-0.6B endpoint, ~0.07s per 40-target call). Corpus
-// scores are cosine means calibrated onto the TF-IDF scale (least squares
+// scores are max-pairwise cosines calibrated onto the TF-IDF scale (least squares
 // fit of the corpus self-scores), so the existing thresholds keep their
 // meaning. ANY failure — construction (server unreachable, HTTP != 200,
 // bad response shape) or per-call — falls back to the plain TF-IDF
@@ -66,7 +66,8 @@ func newEmbeddingScorer(url string, corpus []string) Scorer {
 
 // warm embeds the corpus against itself once (the "targets", embedded
 // lazily on first use and cached under mu) and fits the calibration:
-// x = embedding self-score (mean cosine vs the corpus targets),
+// x = embedding self-score (max pairwise cosine vs the OTHER corpus
+// targets — the diagonal self-pair is excluded, it is always 1.0),
 // y = TF-IDF self-score; least squares a = Cov(x,y)/Var(x),
 // b = meanY − a·meanX maps embedding scores onto the TF-IDF scale.
 // A corpus of <2 titles or a zero-variance x leaves a=1,b=0 (identity).
@@ -90,7 +91,7 @@ func (s *EmbeddingScorer) warm() error {
 	ys := make([]float64, n)
 	mx, my := 0.0, 0.0
 	for i, t := range s.corpus {
-		xs[i] = rowMean(rows[i])
+		xs[i] = rowMaxExcept(rows[i], i)
 		ys[i] = s.inner.Score(t)
 		mx += xs[i]
 		my += ys[i]
@@ -112,7 +113,10 @@ func (s *EmbeddingScorer) warm() error {
 	return nil
 }
 
-// Score returns the calibrated mean cosine of text vs the corpus targets,
+// Score returns the calibrated max pairwise cosine of text vs the corpus
+// targets (max over the row: the strongest corpus match — the mean over 40
+// diverse titles dilutes every match into a generic-tech vector and ranks
+// junk and desired talks within 0.03; the max keeps the margins).
 // clamped to [0,1]. On a per-call error the TF-IDF inner score is
 // returned (errors logged at most once per minute).
 func (s *EmbeddingScorer) Score(text string) float64 {
@@ -124,10 +128,10 @@ func (s *EmbeddingScorer) Score(text string) float64 {
 		s.warnOnce(err)
 		return s.inner.Score(text)
 	}
-	return clamp01(s.a*rowMean(rows[0]) + s.b)
+	return clamp01(s.a*rowMax(rows[0]) + s.b)
 }
 
-// BatchScore scores all texts in one round trip (per-candidate row means,
+// BatchScore scores all texts in one round trip (per-candidate row maxes,
 // calibrated and clamped). On a per-call error every text falls back to
 // the TF-IDF inner scorer.
 func (s *EmbeddingScorer) BatchScore(texts []string) []float64 {
@@ -150,7 +154,7 @@ func (s *EmbeddingScorer) BatchScore(texts []string) []float64 {
 		return out
 	}
 	for i, row := range rows {
-		out[i] = clamp01(s.a*rowMean(row) + s.b)
+		out[i] = clamp01(s.a*rowMax(row) + s.b)
 	}
 	return out
 }
@@ -253,12 +257,29 @@ func parseScoreMatrix(raw json.RawMessage, ncand, ntarget int) ([][]float64, err
 	return nested, nil
 }
 
-func rowMean(row []float64) float64 {
+func rowMax(row []float64) float64 {
 	m := 0.0
 	for _, v := range row {
-		m += v
+		if v > m {
+			m = v
+		}
 	}
-	return m / float64(len(row))
+	return m
+}
+
+// rowMaxExcept returns the row maximum excluding the diagonal self-pair
+// (the corpus-vs-corpus warm matrix always has 1.0 on the diagonal).
+func rowMaxExcept(row []float64, except int) float64 {
+	m := 0.0
+	for j, v := range row {
+		if j == except {
+			continue
+		}
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
 
 func clamp01(v float64) float64 {
