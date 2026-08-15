@@ -177,6 +177,12 @@ func DownloadCmd(cookies, proxy, outDir string, maxHeight int, audioFormat strin
 		"-P", "temp:" + outDir + "/.tmp",
 		"-P", "home:" + outDir,
 		"--concurrent-fragments", "8",
+		// 1MB chunked ranges: the stream servers on this egress 403 open-ended
+		// or large ranges (bytes=0- / >~2MB → 403 "Sorry", bounded ≤1MB → 206,
+		// verified with curl + a chunk-1000 test download on 2026-08-15).
+		// Without this the whole download fails with "unable to download
+		// video data: HTTP Error 403" on the strict servers.
+		"--http-chunk-size", "1048576",
 		"--max-filesize", "4G",
 		"--retry-sleep", "fragment:exp=1:10",
 		"--retry-sleep", "http:linear=1:10",
