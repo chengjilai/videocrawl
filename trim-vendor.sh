@@ -82,7 +82,7 @@ JUNK = {"README.md", "README", "README.markdown", "CHANGELOG.md", "CONTRIBUTING.
         "logo.png", "bench.png", "surface.new", "surface.old", "tpch.sh", "unconvert.sh",
         "mkall.sh", "mkerrors.sh", "build_all_targets.sh", "issue120.diff",
         "nist-sts-2-1-1-report", ".gitignore", ".travis.yml", "embed.db", "embed2.db",
-        "gccgo_c.c"}
+        "gccgo_c.c", "tools.sh"}
 for dirpath, dirnames, filenames in os.walk(VENDOR):
     dirnames[:] = [d for d in dirnames if not d.startswith(".")]
     for f in filenames:
