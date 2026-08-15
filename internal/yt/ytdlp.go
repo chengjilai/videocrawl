@@ -243,10 +243,18 @@ func RunDownload(cmd *exec.Cmd) error {
 // proxy IP), and the translated text can be the longest file the gate
 // scores against an English corpus.
 func SubtitleCmd(cookies, proxy, outDir, url string) *exec.Cmd {
+	return SubtitleCmdTmpl(cookies, proxy, outDir, "%(channel)s/%(id)s_%(title).100B.%(ext)s", url)
+}
+
+// SubtitleCmdTmpl is SubtitleCmd with a caller-supplied output template:
+// the discover transcript stage passes the flat "discover-subs/%(id)s.%(ext)s"
+// layout (subs land in a throwaway temp dir, so the channel/title template
+// would be pointless clutter).
+func SubtitleCmdTmpl(cookies, proxy, outDir, tmpl, url string) *exec.Cmd {
 	args := []string{
 		"--no-playlist",
 		"--skip-download",
-		"-o", "%(channel)s/%(id)s_%(title).100B.%(ext)s",
+		"-o", tmpl,
 		"--restrict-filenames",
 		"-P", "temp:" + outDir + "/.tmp",
 		"-P", "home:" + outDir,

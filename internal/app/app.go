@@ -82,22 +82,37 @@ func (a *App) Add(kind, raw, name, query, topics string) error {
 	return nil
 }
 
-// loadCorpus reads the desired-talk reference (config/semantic-corpus.json)
-// and merges the generic exemplar base. When the file is missing, the
-// generic exemplar base alone is used (the semantic gate always runs).
-func (a *App) loadCorpus() []string {
+// readCorpusFile loads the desired-talk reference titles from
+// config/semantic-corpus.json (VIDEOCRAWL_CORPUS override). A missing file
+// or malformed JSON is an error; callers pick the fallback (loadCorpus
+// merges the generic exemplar base, loadCorpusTitles returns an empty
+// corpus).
+func readCorpusFile() ([]string, error) {
 	path := os.Getenv("VIDEOCRAWL_CORPUS")
 	if path == "" {
 		path = "config/semantic-corpus.json"
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var d struct {
+		Corpus []string `json:"corpus"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, err
+	}
+	return d.Corpus, nil
+}
+
+// loadCorpus reads the desired-talk reference (config/semantic-corpus.json)
+// and merges the generic exemplar base. When the file is missing, the
+// generic exemplar base alone is used (the semantic gate always runs).
+func (a *App) loadCorpus() []string {
 	corpus := score.GenericExemplars()
-	if data, err := os.ReadFile(path); err == nil {
-		var d struct {
-			Corpus []string `json:"corpus"`
-		}
-		if json.Unmarshal(data, &d) == nil {
-			corpus = append(corpus, d.Corpus...)
-		}
+	titles, err := readCorpusFile()
+	if err == nil {
+		corpus = append(corpus, titles...)
 	}
 	return corpus
 }
@@ -180,6 +195,27 @@ func topicFilter(topics string) func(e enum.Entry) bool {
 		}
 		return false
 	}
+}
+
+// semanticPass applies the shared semantic core of the score gate: the
+// topic filter (nil = already applied by the caller), the corpus score of
+// title+channel, and the latin-script check. Returns the score and whether
+// the candidate passes. Used by discovery (gates.score); enumeration runs
+// the same filter/latin cheap gates itself and page-batches the scoring.
+// The threshold gate is deliberately NOT part of the core: discovery's
+// speaker boost must run between the score and the threshold check (a
+// boosted candidate passes with max(score, threshold)), so each caller
+// keeps its own threshold check.
+func semanticPass(scorer score.Scorer, filter func(enum.Entry) bool, title, channel string) (float64, bool) {
+	if filter != nil && !filter(enum.Entry{Title: title, Channel: channel}) {
+		return 0, false
+	}
+	text := title + " " + channel
+	sc := scorer.Score(text)
+	if !mostlyLatin(text) {
+		return sc, false
+	}
+	return sc, true
 }
 
 // normalize maps a user-provided seed to a canonical URL + query.
@@ -378,6 +414,11 @@ func (a *App) Enumerate(ctx context.Context, concurrency, limit int, onlySource 
 		return err
 	}
 	lim := politeness.New(1500 * time.Millisecond)
+	// semantic gate: the scorer is built ONCE for the whole pass (corpus
+	// read + idf/centroid are the expensive part) and shared by every
+	// source's enumOne — per-source construction re-read the corpus file
+	// and rebuilt the idf tables for each source.
+	scorer := score.New(a.loadCorpus())
 	type job struct {
 		src model.Source
 	}
@@ -404,7 +445,7 @@ func (a *App) Enumerate(ctx context.Context, concurrency, limit int, onlySource 
 		go func(j job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := a.enumOne(ctx, deadline, st, cfgs, lim, j.src, limit); err != nil {
+			if err := a.enumOne(ctx, deadline, st, cfgs, lim, scorer, j.src, limit); err != nil {
 				fmt.Fprintf(os.Stderr, "source #%d %s: %v\n", j.src.ID, j.src.URL, err)
 				errs <- err
 			}
@@ -426,7 +467,7 @@ func (a *App) Enumerate(ctx context.Context, concurrency, limit int, onlySource 
 // signal arrives mid-enumeration (checked at each entry boundary).
 var errBudget = errors.New("round time budget exceeded")
 
-func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, cfgs map[string]sites.Site, lim *politeness.Limiter, src model.Source, limit int) error {
+func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, cfgs map[string]sites.Site, lim *politeness.Limiter, scorer score.Scorer, src model.Source, limit int) error {
 	if src.Kind == model.KindDiscover {
 		return nil // discover sources are seeded statically by 'discover --seed'; nothing to enumerate
 	}
@@ -441,40 +482,84 @@ func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, 
 	}
 	filter := topicFilter(src.Topics)
 	// semantic gate: score against the desired-talk reference (upload
-	// history + generic exemplars); keep entries above the threshold.
-	scorer := score.NewSemanticScorer(a.loadCorpus())
+	// history + generic exemplars); keep entries above the threshold. The
+	// scorer is built once in Enumerate and shared by all sources; only
+	// the env-driven threshold is resolved here.
 	threshold := 0.12
 	if v := os.Getenv("VIDEOCRAWL_SEMANTIC_THRESHOLD"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			threshold = f
 		}
 	}
+	// Page-batched semantic gate: entries pass the cheap gates (topic
+	// filter, latin-script check — both pure title/channel predicates)
+	// into a page; when the page fills, the page's title+channel texts
+	// are scored in ONE batch (embedding scorer) or inline (plain TF-IDF
+	// scorer — identical to the old per-entry flow), then each entry
+	// above the threshold is upserted. Entries failing the cheap gates
+	// never enter a page.
+	const pageSize = 64
+	var page []enum.Entry
+	flush := func() error {
+		if len(page) == 0 {
+			return nil
+		}
+		texts := make([]string, len(page))
+		for i, e := range page {
+			texts[i] = e.Title + " " + e.Channel
+		}
+		scores := make([]float64, len(page))
+		if bs, ok := scorer.(score.BatchScorer); ok {
+			scs := bs.BatchScore(texts)
+			copy(scores, scs)
+		} else {
+			for i, t := range texts {
+				scores[i] = scorer.Score(t)
+			}
+		}
+		for i, e := range page {
+			if scores[i] < threshold {
+				continue // semantically unlike the desired corpus — skip
+			}
+			if _, err := st.UpsertVideo(model.Video{
+				SourceID:  src.ID,
+				VideoID:   e.VideoID,
+				URL:       e.URL,
+				Title:     e.Title,
+				Duration:  e.Duration,
+				Published: e.Published,
+				Channel:   e.Channel,
+			}); err != nil {
+				return err
+			}
+			if len(e.Files) > 0 {
+				if err := st.UpsertFiles(src.ID, e.VideoID, e.Files); err != nil {
+					return err
+				}
+			}
+		}
+		page = page[:0]
+		return nil
+	}
 	count, complete, err := fn(src.URL, src.Query, cfg, limit, func(e enum.Entry) error {
 		if dl.Expired(ctx, deadline) {
+			// budget/signal reached: keep the page collected so far, then stop
+			if err := flush(); err != nil {
+				return err
+			}
 			return errBudget
 		}
+		// cheap gates first — the topic filter and the latin-script check
+		// need no score, so they run before the page's batch score pass.
 		if filter != nil && !filter(e) {
-			return nil // out of topic — skip (techcrawl-style topical gate)
-		}
-		if scorer != nil && scorer.Score(e.Title+" "+e.Channel) < threshold {
-			return nil // semantically unlike the desired corpus — skip
+			return nil // topic filter — skip
 		}
 		if !mostlyLatin(e.Title + " " + e.Channel) {
-			return nil // non-Latin script (Khmer/Arabic/...) — off-profile
+			return nil // non-Latin script — skip
 		}
-		if _, err := st.UpsertVideo(model.Video{
-			SourceID:  src.ID,
-			VideoID:   e.VideoID,
-			URL:       e.URL,
-			Title:     e.Title,
-			Duration:  e.Duration,
-			Published: e.Published,
-			Channel:   e.Channel,
-		}); err != nil {
-			return err
-		}
-		if len(e.Files) > 0 {
-			return st.UpsertFiles(src.ID, e.VideoID, e.Files)
+		page = append(page, e)
+		if len(page) >= pageSize {
+			return flush()
 		}
 		return nil
 	})
@@ -488,6 +573,11 @@ func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, 
 		if host != "" {
 			lim.NoteError(host)
 		}
+		return err
+	}
+	// normal completion: flush the trailing partial page (the callback only
+	// flushes at page-full and on budget expiry).
+	if err := flush(); err != nil {
 		return err
 	}
 	if host != "" {

@@ -12,6 +12,7 @@ import (
 
 	"videocrawl/internal/model"
 	"videocrawl/internal/politeness"
+	"videocrawl/internal/score"
 	"videocrawl/internal/sites"
 	"videocrawl/internal/store"
 )
@@ -408,7 +409,7 @@ func TestEnumOneSkipsDiscover(t *testing.T) {
 	}
 	a := &App{DBPath: dbPath}
 	lim := politeness.New(1500 * time.Millisecond)
-	if err := a.enumOne(context.Background(), time.Time{}, st, map[string]sites.Site{}, lim, src, 10); err != nil {
+	if err := a.enumOne(context.Background(), time.Time{}, st, map[string]sites.Site{}, lim, score.NewSemanticScorer(nil), src, 10); err != nil {
 		t.Fatalf("enumOne(discover): %v", err)
 	}
 	rows, _ := st.VideoRows("", 10)

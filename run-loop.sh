@@ -25,6 +25,9 @@
 cd "$HOME/videocrawl" || exit 1
 export VIDEOCRAWL_WARP_SOCKS=off VIDEOCRAWL_NO_PROXY_CHECK=1
 export VIDEOCRAWL_PROXY=http://127.0.0.1:18888
+# VIDEOCRAWL_EMBED_URL: the lab embedding server (Qwen3-Embedding-0.6B);
+# the crawler falls back to TF-IDF scoring if it is down.
+export VIDEOCRAWL_EMBED_URL=http://127.0.0.1:8700/embed
 export VIDEOCRAWL_OUT="$HOME/Videos/Crawl"
 export VIDEOCRAWL_DB="$HOME/videocrawl/videocrawl.db"
 export VIDEOCRAWL_COOKIES_DIR="$HOME/videocrawl/cookies"

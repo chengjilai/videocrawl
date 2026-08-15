@@ -17,7 +17,12 @@ import (
 
 var tokenRe = regexp.MustCompile(`[a-z0-9][a-z0-9+.#_-]*`)
 
-func tokenize(text string) []string {
+// Tokenize splits text into corpus tokens: lowercase runs of
+// [a-z0-9+.#_-] at least 2 chars long, with the score STOPWORDS dropped.
+// This is the tokenizer NewSemanticScorer builds its vocabulary from, and
+// the token shape discover's jaccard dedup shares (discover.tokenSet
+// reproduces this function exactly).
+func Tokenize(text string) []string {
 	low := strings.ToLower(text)
 	toks := tokenRe.FindAllString(low, -1)
 	out := make([]string, 0, len(toks))
@@ -50,7 +55,7 @@ func NewSemanticScorer(corpus []string) *SemanticScorer {
 	df := map[string]int{}
 	for _, ex := range corpus {
 		seen := map[string]bool{}
-		for _, tok := range tokenize(ex) {
+		for _, tok := range Tokenize(ex) {
 			if !seen[tok] {
 				seen[tok] = true
 				df[tok]++
@@ -83,7 +88,7 @@ func NewSemanticScorer(corpus []string) *SemanticScorer {
 
 func (s *SemanticScorer) vector(text string) map[string]float64 {
 	counts := map[string]int{}
-	for _, tok := range tokenize(text) {
+	for _, tok := range Tokenize(text) {
 		counts[tok]++
 	}
 	vec := map[string]float64{}

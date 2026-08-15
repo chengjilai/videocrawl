@@ -52,7 +52,7 @@ type Pool struct {
 	fail    int
 	skip    int
 	// transcript relevance gate (off unless a corpus is configured):
-	scorer              *score.SemanticScorer
+	scorer              score.Scorer
 	transcriptThreshold float64
 	// shared gallica session (altcha PoW solved once per pool)
 	gallicaMu sync.Mutex
@@ -71,15 +71,16 @@ type Option func(*Pool)
 func WithCorpus(corpus []string) Option {
 	return func(p *Pool) {
 		if len(corpus) > 0 {
-			p.scorer = score.NewSemanticScorer(corpus)
+			p.scorer = score.New(corpus)
 		}
 	}
 }
 
-// transcriptThreshold: minimum transcript semantic score; below it a
+// TranscriptThreshold: minimum transcript semantic score; below it a
 // downloaded video is skipped. Default 0.15, override
-// VIDEOCRAWL_TRANSCRIPT_THRESHOLD.
-func transcriptThreshold() float64 {
+// VIDEOCRAWL_TRANSCRIPT_THRESHOLD. Shared with the discover command's
+// transcript stage (app.discoverTranscripts).
+func TranscriptThreshold() float64 {
 	t := 0.15
 	if v := os.Getenv("VIDEOCRAWL_TRANSCRIPT_THRESHOLD"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -90,7 +91,7 @@ func transcriptThreshold() float64 {
 }
 
 func NewPool(st *store.Store, sites map[string]sites.Site, outDir string, policy Policy, workers int, opts ...Option) *Pool {
-	p := &Pool{store: st, sites: sites, outDir: outDir, policy: policy, workers: workers, transcriptThreshold: transcriptThreshold()}
+	p := &Pool{store: st, sites: sites, outDir: outDir, policy: policy, workers: workers, transcriptThreshold: TranscriptThreshold()}
 	for _, o := range opts {
 		o(p)
 	}

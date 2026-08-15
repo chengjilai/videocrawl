@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -114,18 +113,6 @@ func discoverSemanticDefault() float64 {
 	return t
 }
 
-// transcriptThreshold: VIDEOCRAWL_TRANSCRIPT_THRESHOLD, default 0.15 (the
-// download gate's transcript score floor).
-func transcriptThreshold() float64 {
-	t := 0.15
-	if v := os.Getenv("VIDEOCRAWL_TRANSCRIPT_THRESHOLD"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			t = f
-		}
-	}
-	return t
-}
-
 // candidate: one discovered talk passing the gates.
 type candidate struct {
 	Source   string // yt | hn | ccc
@@ -141,8 +128,9 @@ type candidate struct {
 
 // gates: the shared discovery gates.
 type gates struct {
-	corpusTitles []string // uploaded-talk titles (jaccard dedup)
-	scorer       *score.SemanticScorer
+	corpusSets   []map[string]bool // token sets of the corpus titles (precomputed once in newGates)
+	scorer       score.Scorer
+	pre          map[string]float64    // preScores cache: score text -> corpus score (nil unless batch-scored)
 	filter       func(enum.Entry) bool // topicFilter(topics)
 	threshold    float64
 	includeKnown bool
@@ -152,9 +140,8 @@ type gates struct {
 }
 
 func newGates(corpusFull, corpusTitles []string, knownURLs, knownIDs map[string]bool, o DiscoverOpts) *gates {
-	return &gates{
-		corpusTitles: corpusTitles,
-		scorer:       score.NewSemanticScorer(corpusFull),
+	g := &gates{
+		scorer:       score.New(corpusFull),
 		filter:       topicFilter(o.Topics),
 		threshold:    o.Threshold,
 		includeKnown: o.IncludeKnown,
@@ -162,6 +149,10 @@ func newGates(corpusFull, corpusTitles []string, knownURLs, knownIDs map[string]
 		knownIDs:     knownIDs,
 		speakers:     SpeakerNames(corpusTitles),
 	}
+	// jaccard dedup token sets: re-tokenizing every corpus title per
+	// candidate dominated the gate's cost, so they are precomputed once.
+	g.corpusSets = tokenSets(corpusTitles)
+	return g
 }
 
 // known reports whether the candidate is already in the videos table (URL
@@ -181,11 +172,13 @@ func (g *gates) known(c *candidate) bool {
 
 // gate applies the shared gates. Candidates already known (videos table or
 // a >=0.7 title-Jaccard duplicate of an uploaded talk) drop unless
-// --include-known (then they pass, tagged Known). The SPEAKER BOOST applies
-// here too: a title/channel containing a corpus speaker name scores
+// --include-known (then they pass, tagged Known). The filter→score→latin
+// core is semanticPass (shared with enumeration); the score itself comes
+// from the preScores batch cache when one was computed. The SPEAKER BOOST
+// applies on top: a title/channel containing a corpus speaker name scores
 // max(score, threshold) and passes the semantic gate. Returns false to drop.
 func (g *gates) gate(c *candidate) bool {
-	if g.known(c) || corpusJaccard(c.Title, g.corpusTitles) >= 0.7 {
+	if g.known(c) || corpusJaccard(c.Title, g.corpusSets) >= 0.7 {
 		if !g.includeKnown {
 			return false
 		}
@@ -194,7 +187,11 @@ func (g *gates) gate(c *candidate) bool {
 	if g.filter != nil && !g.filter(enum.Entry{Title: c.Title, Channel: c.Channel}) {
 		return false
 	}
-	c.Score = g.scorer.Score(c.Title + " " + c.Channel)
+	sc, ok := g.score(c.Title, c.Channel)
+	if !ok {
+		return false
+	}
+	c.Score = sc
 	if name := matchSpeaker(c.Title+" "+c.Channel, g.speakers); name != "" {
 		c.Speaker = name
 		c.Score = math.Max(c.Score, g.threshold)
@@ -202,37 +199,87 @@ func (g *gates) gate(c *candidate) bool {
 	if g.threshold > 0 && c.Score < g.threshold {
 		return false
 	}
-	if !mostlyLatin(c.Title + " " + c.Channel) {
-		return false
-	}
 	return true
+}
+
+// score returns the corpus score of a candidate's title+channel — the
+// preScores cache when available (embedding batch), otherwise the shared
+// semanticPass core (the topic filter was already applied by the caller,
+// so nil is passed here).
+func (g *gates) score(title, channel string) (float64, bool) {
+	text := title + " " + channel
+	if v, have := g.pre[text]; have {
+		return v, mostlyLatin(text)
+	}
+	return semanticPass(g.scorer, nil, title, channel)
+}
+
+// preScores: when the scorer implements BatchScorer (the embedding
+// backend), score every candidate text in one round trip and cache the
+// results by exact text — gate() then serves them without per-candidate
+// HTTP calls. Plain TF-IDF scorers are not batch scorers: no-op.
+func (g *gates) preScores(cs []*candidate) {
+	bs, ok := g.scorer.(score.BatchScorer)
+	if !ok || len(cs) == 0 {
+		return
+	}
+	var texts []string
+	seen := map[string]bool{}
+	for _, c := range cs {
+		t := c.Title + " " + c.Channel
+		if !seen[t] {
+			seen[t] = true
+			texts = append(texts, t)
+		}
+	}
+	if len(texts) == 0 {
+		return
+	}
+	scs := bs.BatchScore(texts)
+	g.pre = make(map[string]float64, len(texts))
+	for i, t := range texts {
+		g.pre[t] = scs[i]
+	}
 }
 
 // finalize re-scores a candidate after enrichment (yt GetMeta / ccc
 // abstract) and applies the SPEAKER BOOST: when the title or channel
 // contains a corpus speaker name, score = max(score, threshold) so the talk
 // passes regardless. Returns false when the enriched score drops below the
-// threshold (unless boosted).
+// threshold (unless boosted). Carries the same `threshold > 0 &&` guard as
+// gate (behavior-neutral: cosine scores are non-negative, so a zero
+// threshold never rejects) to keep the two contracts uniform.
 func (g *gates) finalize(c *candidate, scoreText string) bool {
-	c.Score = g.scorer.Score(scoreText)
+	// the preScores batch may already hold this exact text (e.g. HN
+	// re-scores title+channel verbatim after the gate); enriched texts
+	// (yt GetMeta / ccc abstract) miss the cache and score directly.
+	if v, have := g.pre[scoreText]; have {
+		c.Score = v
+	} else {
+		c.Score = g.scorer.Score(scoreText)
+	}
 	if name := matchSpeaker(c.Title+" "+c.Channel, g.speakers); name != "" {
 		c.Speaker = name
 		c.Score = math.Max(c.Score, g.threshold)
 	}
+	if g.threshold > 0 && c.Score < g.threshold {
+		return false
+	}
 	return c.Score >= g.threshold || c.Speaker != ""
 }
 
-// corpusJaccard: max token-set Jaccard of title against any corpus title
-// (corpus tokenizer semantics). >=0.7 means "the same talk, already
-// uploaded" — the dedup complement to the videos table.
-func corpusJaccard(title string, corpusTitles []string) float64 {
+// corpusJaccard: max token-set Jaccard of title against any corpus title's
+// PRE-COMPUTED token sets (tokenSets — newGates builds them once; the
+// per-candidate re-tokenization of the whole corpus is what this avoids).
+// >=0.7 means "the same talk, already uploaded" — the dedup complement to
+// the videos table.
+func corpusJaccard(title string, corpusSets []map[string]bool) float64 {
 	a := tokenSet(title)
 	if len(a) == 0 {
 		return 0
 	}
 	best := 0.0
-	for _, ct := range corpusTitles {
-		b := tokenSet(ct)
+	for _, b := range corpusSets {
 		if len(b) == 0 {
 			continue
 		}
@@ -250,14 +297,20 @@ func corpusJaccard(title string, corpusTitles []string) float64 {
 	return best
 }
 
-// tokenSet: the corpus tokenizer applied to one text (lowercase tokens,
-// len>=2, score STOPWORDS dropped), as a set.
+// tokenSets precomputes the corpus token sets for corpusJaccard.
+func tokenSets(titles []string) []map[string]bool {
+	sets := make([]map[string]bool, 0, len(titles))
+	for _, t := range titles {
+		sets = append(sets, tokenSet(t))
+	}
+	return sets
+}
+
+// tokenSet: the corpus tokenizer (score.Tokenize: lowercase tokens, len>=2,
+// STOPWORDS dropped) applied to one text, as a set.
 func tokenSet(s string) map[string]bool {
 	set := map[string]bool{}
-	for _, tok := range qTokRe.FindAllString(strings.ToLower(s), -1) {
-		if len(tok) < 2 || score.STOPWORDS[tok] {
-			continue
-		}
+	for _, tok := range score.Tokenize(s) {
 		set[tok] = true
 	}
 	return set
@@ -311,21 +364,9 @@ func knownVideoSets(st *store.Store) (urls, ids map[string]bool, err error) {
 // loadCorpusTitles: the uploaded-talk titles (config/semantic-corpus.json,
 // VIDEOCRAWL_CORPUS override) — the query/discovery source. The generic
 // exemplar base is intentionally NOT included: queries derive from the
-// actual uploads.
+// actual uploads. Shared with loadCorpus via readCorpusFile.
 func (a *App) loadCorpusTitles() []string {
-	path := os.Getenv("VIDEOCRAWL_CORPUS")
-	if path == "" {
-		path = "config/semantic-corpus.json"
-	}
-	var titles []string
-	if data, err := os.ReadFile(path); err == nil {
-		var d struct {
-			Corpus []string `json:"corpus"`
-		}
-		if json.Unmarshal(data, &d) == nil {
-			titles = d.Corpus
-		}
-	}
+	titles, _ := readCorpusFile()
 	return titles
 }
 
@@ -549,22 +590,29 @@ func (a *App) discoverYT(ctx context.Context, g *gates, lim *politeness.Limiter,
 	}
 	lim.NoteSuccess("youtube.com")
 
-	var passed []candidate
+	// collect the raw entries first so the whole list is batch-scored
+	// (embedding scorer: one round trip) BEFORE the gate loop and the
+	// per-query truncation below.
+	var cands []*candidate
 	for _, e := range raws {
 		if e.ID == "" || e.Title == "" {
 			continue
 		}
-		c := candidate{
+		cands = append(cands, &candidate{
 			Source:  "yt",
 			VideoID: e.ID,
 			URL:     "https://www.youtube.com/watch?v=" + e.ID,
 			Title:   e.Title,
 			Channel: e.Channel,
-		}
-		if !g.gate(&c) {
+		})
+	}
+	g.preScores(cands)
+	var passed []candidate
+	for _, c := range cands {
+		if !g.gate(c) {
 			continue
 		}
-		passed = append(passed, c)
+		passed = append(passed, *c)
 	}
 	sort.Slice(passed, func(i, j int) bool { return passed[i].Score > passed[j].Score })
 	if len(passed) > perQuery {
@@ -615,6 +663,7 @@ func (a *App) discoverHN(ctx context.Context, g *gates, lim *politeness.Limiter,
 	}
 	lim.NoteSuccess("hn.algolia.com")
 	n := 0
+	var cands []*candidate
 	for _, h := range hits {
 		if dl.Expired(ctx, time.Time{}) {
 			break
@@ -622,9 +671,6 @@ func (a *App) discoverHN(ctx context.Context, g *gates, lim *politeness.Limiter,
 		kind, canon := enum.HNClassifyURL(h.URL)
 		switch kind {
 		case enum.HNVideo:
-			if n >= o.PerQuery {
-				continue
-			}
 			c := candidate{Source: "hn", URL: canon, Title: h.Title}
 			if id := ytVideoID(canon); id != "" {
 				c.VideoID = id
@@ -632,14 +678,7 @@ func (a *App) discoverHN(ctx context.Context, g *gates, lim *politeness.Limiter,
 				c.VideoID = gid
 				c.Channel = "media.ccc.de"
 			}
-			if !g.gate(&c) {
-				continue
-			}
-			if !g.finalize(&c, c.Title+" "+c.Channel) {
-				continue
-			}
-			n++
-			emit(c)
+			cands = append(cands, &c)
 		case enum.HNSeed:
 			seedLine(h.URL, h.Title)
 		default:
@@ -647,6 +686,25 @@ func (a *App) discoverHN(ctx context.Context, g *gates, lim *politeness.Limiter,
 				leadLine(h.URL, h.Title)
 			}
 		}
+	}
+	// batch-score the collected candidates (embedding scorer) before the
+	// gate loop, then gate/emit with the original per-query cap.
+	g.preScores(cands)
+	for _, c := range cands {
+		if dl.Expired(ctx, time.Time{}) {
+			break
+		}
+		if n >= o.PerQuery {
+			continue
+		}
+		if !g.gate(c) {
+			continue
+		}
+		if !g.finalize(c, c.Title+" "+c.Channel) {
+			continue
+		}
+		n++
+		emit(*c)
 	}
 	return nil
 }
@@ -664,25 +722,32 @@ func (a *App) discoverCCC(ctx context.Context, g *gates, lim *politeness.Limiter
 		return fmt.Errorf("ccc: %w", err)
 	}
 	lim.NoteSuccess("media.ccc.de")
-	var passed []candidate
+	// collect ALL events first, batch-score them (embedding scorer), then
+	// gate — the per-query truncation moves AFTER the batch/gate loop so
+	// the batch covers every collected event.
+	var cands []*candidate
 	for _, e := range events {
-		c := candidate{
+		cands = append(cands, &candidate{
 			Source:   "ccc",
 			VideoID:  e.GUID,
 			URL:      "https://media.ccc.de/v/" + e.GUID,
 			Title:    e.Title,
 			Channel:  strings.Join(e.Persons, ", "),
 			Duration: e.Duration,
-		}
-		if !g.gate(&c) {
+		})
+	}
+	g.preScores(cands)
+	var passed []candidate
+	for _, c := range cands {
+		if !g.gate(c) {
 			continue
 		}
-		passed = append(passed, c)
-		if len(passed) >= perQuery {
-			break
-		}
+		passed = append(passed, *c)
 	}
 	sort.Slice(passed, func(i, j int) bool { return passed[i].Score > passed[j].Score })
+	if len(passed) > perQuery {
+		passed = passed[:perQuery]
+	}
 	for i := range passed {
 		if dl.Expired(ctx, time.Time{}) {
 			break
@@ -715,7 +780,7 @@ func (a *App) discoverCCC(ctx context.Context, g *gates, lim *politeness.Limiter
 // (VIDEOCRAWL_TRANSCRIPT_THRESHOLD, default 0.15). Report only — nothing
 // is written to the DB.
 func (a *App) discoverTranscripts(ctx context.Context, g *gates, lim *politeness.Limiter, results []candidate, jsonOut bool) error {
-	thr := transcriptThreshold()
+	thr := dl.TranscriptThreshold()
 	tmp, err := os.MkdirTemp("", "videocrawl-discover-*")
 	if err != nil {
 		return err
@@ -723,31 +788,65 @@ func (a *App) discoverTranscripts(ctx context.Context, g *gates, lim *politeness
 	defer os.RemoveAll(tmp)
 	cfg := a.sites()["youtube"]
 	proxy := sites.ProxyURL(cfg)
-	scorer := score.NewSemanticScorer(a.loadCorpus())
+	scorer := score.New(a.loadCorpus())
 	enc := json.NewEncoder(os.Stdout)
+
+	// 1. fetch ALL subtitles first (as many as succeed) and extract the
+	// plain text — the batch score pass below then makes ONE set of
+	// embedding round trips instead of one per candidate.
+	texts := make([]string, len(results))
 	for i, c := range results {
 		if dl.Expired(ctx, time.Time{}) {
 			break
 		}
 		lim.Wait("youtube.com")
-		args := []string{
-			"--skip-download", "--write-auto-subs", "--sub-langs", "en,en-orig",
-			"--sub-format", "srt/best", "--no-playlist", "--no-warnings",
-			"--socket-timeout", "60",
-			"-o", "discover-subs/%(id)s.%(ext)s",
-			"-P", "home:" + tmp,
-		}
-		if proxy != "" {
-			args = append(args, "--proxy", proxy)
-		}
-		cmd := exec.Command(yt.Bin(), args...)
-		cmd.Args = append(cmd.Args, "--", c.URL)
+		// the shared SubtitleCmd pass with discover's flat layout: subs land
+		// in <tmp>/discover-subs/<id>.<ext> (the throwaway tmp dir, so the
+		// channel/title output template would be pointless clutter).
+		cmd := yt.SubtitleCmdTmpl("", proxy, tmp, "discover-subs/%(id)s.%(ext)s", c.URL)
 		_ = yt.RunWithRetry(ctx, cmd, 30*time.Second, 60*time.Second) // failures just mean no subs
-		text := dl.TranscriptText(tmp, c.VideoID)
-		sc := 0.0
-		if text != "" {
-			sc = scorer.Score(text)
+		texts[i] = dl.TranscriptText(tmp, c.VideoID)
+	}
+
+	// 2. ONE batch score pass (chunked; empty transcripts are skipped —
+	// they report "none" below).
+	scores := make([]float64, len(texts))
+	if bs, ok := scorer.(score.BatchScorer); ok {
+		var idx []int
+		var batch []string
+		for i, t := range texts {
+			if t == "" {
+				continue
+			}
+			idx = append(idx, i)
+			batch = append(batch, t)
 		}
+		const chunk = 32
+		for start := 0; start < len(batch); start += chunk {
+			end := start + chunk
+			if end > len(batch) {
+				end = len(batch)
+			}
+			sc := bs.BatchScore(batch[start:end])
+			for j, v := range sc {
+				scores[idx[start+j]] = v
+			}
+		}
+	} else {
+		for i, t := range texts {
+			if t != "" {
+				scores[i] = scorer.Score(t)
+			}
+		}
+	}
+
+	// 3. report (same lines/JSON as before, in rank order).
+	for i, c := range results {
+		if dl.Expired(ctx, time.Time{}) {
+			break
+		}
+		text := texts[i]
+		sc := scores[i]
 		status := "none"
 		if text != "" {
 			if sc >= thr {

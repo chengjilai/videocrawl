@@ -73,6 +73,12 @@ bilibili.txt from ~/nixos/scripts/export-cookies.py),
 `VIDEOCRAWL_WARP_SOCKS` (WARP socks addr probed by the health check,
 default 127.0.0.1:40000; `off` disables the probe),
 `VIDEOCRAWL_NO_PROXY_CHECK` (set to 1 to skip the smart-proxy health probe),
+`VIDEOCRAWL_EMBED_URL` (embedding scorer backend, e.g.
+http://127.0.0.1:8700/embed — Qwen3-Embedding on lab; TF-IDF fallback if
+unreachable; scores are calibrated onto the TF-IDF scale so the semantic
+thresholds keep their meaning),
+`VIDEOCRAWL_SEMANTIC_THRESHOLD` (enumerate gate, default 0.12),
+`VIDEOCRAWL_TRANSCRIPT_THRESHOLD` (transcript gate, default 0.15),
 `VIDEOCRAWL_STRIPES` (native ccc stripes per file, default 4, cap 6),
 `VIDEOCRAWL_RATE_CEIL_MB` (per-file ccc rate ceiling, default 4 MiB/s).
 

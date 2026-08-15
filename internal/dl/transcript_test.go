@@ -166,15 +166,15 @@ func TestGateTranscript(t *testing.T) {
 // TestTranscriptThresholdEnv: VIDEOCRAWL_TRANSCRIPT_THRESHOLD overrides the
 // 0.15 default.
 func TestTranscriptThresholdEnv(t *testing.T) {
-	if got := transcriptThreshold(); got != 0.15 {
+	if got := TranscriptThreshold(); got != 0.15 {
 		t.Fatalf("default threshold = %v, want 0.15", got)
 	}
 	t.Setenv("VIDEOCRAWL_TRANSCRIPT_THRESHOLD", "0.42")
-	if got := transcriptThreshold(); got != 0.42 {
+	if got := TranscriptThreshold(); got != 0.42 {
 		t.Fatalf("env threshold = %v, want 0.42", got)
 	}
 	t.Setenv("VIDEOCRAWL_TRANSCRIPT_THRESHOLD", "junk")
-	if got := transcriptThreshold(); got != 0.15 {
+	if got := TranscriptThreshold(); got != 0.15 {
 		t.Fatalf("bad env threshold = %v, want fallback 0.15", got)
 	}
 }

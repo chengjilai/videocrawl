@@ -53,9 +53,9 @@ var microStopwords = map[string]bool{
 // a topic.
 var yearRe = regexp.MustCompile(`\d{4}$`)
 
-// qTokRe: the corpus tokenizer pattern (the same shape as score.tokenize's
+// qTokRe: the corpus tokenizer pattern (the same shape as score.Tokenize's
 // regexp), case-preserving so proper names can be detected in the raw
-// titles. A lowercase pass over the same pattern reproduces score.tokenize
+// titles. A lowercase pass over the same pattern reproduces score.Tokenize
 // exactly (len>=2, STOPWORDS dropped).
 var qTokRe = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9+.#_-]*`)
 
@@ -178,10 +178,11 @@ func classifyToken(t corpusToken) tokenClass {
 	return tokDrop
 }
 
-// Query caps: total generated queries stay at queryBudget
-// (speakerCap + conferenceCap*3 + topicCap) when the corpus is rich.
+// Query caps: total generated queries top out at speakerCap +
+// conferenceCap*3 + topicCap = 25 (10 speaker, 12 conference, 3 topic
+// queries) when the corpus is rich; user-supplied --query strings are
+// appended on top (never trimmed by the caps).
 const (
-	queryBudget   = 12 // ~12 yt-dlp searches per run; each costs seconds through the proxy
 	speakerCap    = 10
 	conferenceCap = 4
 	topicCap      = 3

@@ -197,19 +197,20 @@ func TestCorpusJaccard(t *testing.T) {
 		"Go with Versions - Russ Cox (GopherConSG 2018)",
 		"Reliability Lessons From SQLite - Richard Hipp @ SSW 2026",
 	}
+	sets := tokenSets(corpus)
 	// near-duplicate of an uploaded talk (one token differs)
-	if j := corpusJaccard("Go with Versions - Russ Cox (GopherCon 2018)", corpus); j < 0.7 {
+	if j := corpusJaccard("Go with Versions - Russ Cox (GopherCon 2018)", sets); j < 0.7 {
 		t.Errorf("near-dup jaccard = %.2f, want >= 0.7", j)
 	}
 	// the same talk verbatim
-	if j := corpusJaccard("Reliability Lessons From SQLite - Richard Hipp @ SSW 2026", corpus); j < 0.99 {
+	if j := corpusJaccard("Reliability Lessons From SQLite - Richard Hipp @ SSW 2026", sets); j < 0.99 {
 		t.Errorf("verbatim jaccard = %.2f", j)
 	}
 	// novel talk: far below the dup threshold
-	if j := corpusJaccard("History of the Disney Parks", corpus); j >= 0.7 {
+	if j := corpusJaccard("History of the Disney Parks", sets); j >= 0.7 {
 		t.Errorf("unrelated jaccard = %.2f, want < 0.7", j)
 	}
-	if j := corpusJaccard("", corpus); j != 0 {
+	if j := corpusJaccard("", sets); j != 0 {
 		t.Errorf("empty title jaccard = %.2f, want 0", j)
 	}
 }
@@ -250,7 +251,7 @@ func TestDiscoverGates(t *testing.T) {
 	}
 	newG := func(includeKnown bool, topics string) *gates {
 		return &gates{
-			corpusTitles: corpusTitles,
+			corpusSets:   tokenSets(corpusTitles),
 			scorer:       score.NewSemanticScorer(corpusTitles),
 			filter:       topicFilter(topics),
 			threshold:    0.12,
