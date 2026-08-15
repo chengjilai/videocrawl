@@ -48,6 +48,14 @@ videocrawl download  --workers 6 --min-dur 60 --max-dur 7200
 videocrawl crawl-loop --every 3600 --limit 20 --workers 6 --max-time 3600
 videocrawl status
 videocrawl list --status done --json      # feed the bilibili upload pipeline
+
+# channel-unbiased find→upload: corpus-driven search (ytsearch + HN Algolia
+# + ccc events) ranks talks by semantic relevance; --seed queues the top-N
+# into the static 'discover' source. Scored rows flow to the download and
+# upload queues BEFORE unscored ones (relevance order), and the transcript
+# gate at download time is the precision backstop.
+videocrawl discover --limit 10 --seed 10     # --sources yt,hn,ccc; --threshold 0.16
+videocrawl upload --upload-allowlist cc,pt,disc,22,23,24   # 'disc' = discover source
 ```
 
 `download` / `crawl-loop` default to **6 workers** (lab-tuned; was 3). On
