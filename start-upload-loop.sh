@@ -73,7 +73,6 @@ cmd_stop() {
   log "stopping upload loop: pkill -f 'sync-upload[.]sh' (loop + in-flight round), pkill -f 'upload-loop[.]log' (leftover variants)"
   pkill -f 'sync-upload[.]sh' 2>/dev/null || true
   pkill -f 'upload-loop[.]log' 2>/dev/null || true
-  rm -f "$HOME/upload-loop.pid"   # stale pidfile from the old setsid-based design, if any
   sleep 2
   if loop_alive; then
     log "WARNING: upload loop still alive after SIGTERM; use: pkill -KILL -f 'sync-upload[.]sh'"

@@ -48,11 +48,15 @@ case "${1:-}" in
     echo "started pid $(cat "$LOOP_PIDFILE") → $LOG"
     ;;
   stop)
-    # pidfile only — a pkill -f 'music-upload-loop' would match this very
-    # script's cmdline and kill itself (the start-upload-loop.sh [.] lesson).
+    # pidfile first; the bracket pattern (safe since the status branch) is
+    # the fallback for a stale pidfile — setsid forks under job control, so
+    # $! can record a short-lived parent while the loop itself survives.
     if [ -f "$LOOP_PIDFILE" ]; then
       kill "$(cat "$LOOP_PIDFILE")" 2>/dev/null
       rm -f "$LOOP_PIDFILE"
+    fi
+    if pgrep -f 'music-upload-loop[.]sh loop' >/dev/null; then
+      pkill -f 'music-upload-loop[.]sh loop' 2>/dev/null
       echo stopped
     else
       echo "not running (no pidfile)"
@@ -62,6 +66,6 @@ case "${1:-}" in
     while true; do round >> "$LOG" 2>&1; sleep 1500; done
     ;;
   status)
-    pgrep -af 'music-upload-loop' | grep -v grep | head -2
+    pgrep -af 'music-upload-loop[.]sh loop' | grep -v grep | head -2
     ;;
 esac

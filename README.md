@@ -131,28 +131,33 @@ The crawl-loop is hardened for long-running, no-intervention operation:
   hash + mark it.
 - **Signals.** SIGINT/SIGTERM trigger graceful shutdown: the loop stops
   scheduling new work, the current video finishes, the DB is flushed
-  (WAL checkpoint on Close) and the process exits 0. `start-loop.sh stop`
-  uses this path.
+  (WAL checkpoint on Close) and the process exits 0. Stopping the
+  aturing-side upload loop uses pkill with bracket tricks
+  (`pkill -f 'sync-upload[.]sh'` + `pkill -f 'upload-loop[.]log'` in
+  `start-upload-loop.sh stop`) — the patterns must not match the stopper's
+  own cmdline (documented in that script's header; the tricks are real,
+  verified 2026-08-14). On lab, `pkill -f 'videocrawl crawl[-]loop'`
+  reaches the Go process through run-loop.sh's `exec` chain.
 
-### start-loop.sh (watchdog)
+### Lab loop (run-loop.sh)
 
-`./start-loop.sh [start|stop|status]` keeps the rig alive unattended on the
-lab: it (re)establishes the reverse tunnel
-(`ssh -fN -R 18888:127.0.0.1:8888 lab`, with `ExitOnForwardFailure` and
-`ServerAlive` so a dead tunnel is detected and replaced) and starts
-`videocrawl crawl-loop` with `nohup` on the crawl host, then watches both
-and restarts whichever died. Loop liveness is tracked by command line
-(`pgrep -f 'videocrawl crawl[-]loop'`), so SIGTERM reliably reaches the Go
-process through the nohup/env wrapper chain. Config via env: `LOOP_HOST`
-(lab or `local`), `TUNNEL_HOST`, `TUNNEL_PORT`, `TUNNEL_LOCAL`, `LOOP_DIR`,
-`LOOP_ENV`, `LOOP_ARGS`, `LOG_DIR`, `WATCH_INTERVAL` — see the header of
-the script.
+The lab crawl-loop is started by `~/videocrawl/run-loop.sh` (runs on lab
+only; the tracked copy in this repo is documentation — lab's own copy is
+the live one). It sets the lab env, then `exec`s the loop — so `pgrep`
+sees `./videocrawl crawl-loop`, not run-loop.sh:
+
+- `VIDEOCRAWL_WARP_SOCKS=off` — no WARP socks on lab; skip the probe.
+- `VIDEOCRAWL_NO_PROXY_CHECK=1` — skip the smart-proxy health probe.
+- `VIDEOCRAWL_PROXY=http://127.0.0.1:18888` — reach aturing's smart-proxy
+  through the manual reverse tunnel (`ssh -R 18888:127.0.0.1:8888 lab`),
+  kept up unattended by the `lab-proxy-tunnel` systemd unit on aturing.
+- `--limit 8 --workers 6 --max-time 3000` — the live tune (2026-08-15).
+
+**No watchdog.** If the crawl-loop dies nothing restarts it (the old
+watchdog script was deleted 2026-08-15). Restart manually on lab:
 
 ```sh
-# on the machine with the smart-proxy (aturing):
-./start-loop.sh start      # tunnel + crawl-loop, then watch both forever
-./start-loop.sh status
-./start-loop.sh stop       # watchdog first, then graceful SIGTERM to the loop
+nohup ~/videocrawl/run-loop.sh >> ~/crawl-loop.log 2>&1 &
 ```
 
 ## Egress
@@ -196,13 +201,19 @@ polite per-file ceiling lives on the native ccc path (see Egress).
 ## Lab deployment
 
 ```sh
-scp videocrawl start-loop.sh lab:~/videocrawl/
+scp videocrawl run-loop.sh lab:~/videocrawl/
 ssh lab 'python3 -m pip install --user -q yt-dlp'
-# reverse tunnel (from aturing; lab reaches the smart-proxy at :18888):
-ssh -fN -R 18888:127.0.0.1:8888 lab
-# or, unattended: the watchdog manages tunnel + loop and restarts on death
-./start-loop.sh start
-# manual equivalent (defaults: 6 workers, 4 ccc stripes, 4MiB/s/file ceiling):
-ssh lab 'VIDEOCRAWL_PROXY=http://127.0.0.1:18888 VIDEOCRAWL_OUT=~/Videos/Crawl \
-  nohup ~/videocrawl/videocrawl crawl-loop --every 3600 --limit 20 --workers 6 --max-time 3600 > ~/videocrawl-loop.log 2>&1 &'
+ssh lab 'nohup ~/videocrawl/run-loop.sh >> ~/crawl-loop.log 2>&1 &'
 ```
+
+- **Tunnel.** The reverse tunnel is the `lab-proxy-tunnel` systemd unit on
+  aturing (manual equivalent: `ssh -fN -R 18888:127.0.0.1:8888 lab`);
+  run-loop.sh expects the smart-proxy at `127.0.0.1:18888`.
+- **No watchdog.** If the crawl-loop dies nothing restarts it — restart
+  manually (see "Lab loop (run-loop.sh)" above).
+- **Upload loops are aturing-only, by design** (the bilibili web session
+  lives on aturing): `music-upload-loop.sh` (PD music: rsync lab's staged
+  `Videos/Post/` + merge repost state, upload one item per round) and
+  `start-upload-loop.sh` driving `sync-upload.sh` (crawl → bilibili, one
+  video per round, 20-min pace). Lab runs downloads only — the upload
+  scripts do not exist there.

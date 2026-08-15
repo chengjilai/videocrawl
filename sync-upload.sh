@@ -10,7 +10,7 @@
 #      with sidecars present the glob expands to >1 file, and rsync refuses
 #      a plain-file destination for multiple sources.)
 #   2. UPLOAD at most one done video to bilibili:
-#        videocrawl upload --upload-allowlist cc --limit 1 \
+#        videocrawl upload --upload-allowlist cc,pt,disc,22,23,24 --limit 1 \
 #          --path-prefix-rewrite /home/sjtu/Videos/Crawl:$FILES
 #      (the DB + out dir are passed via VIDEOCRAWL_DB / VIDEOCRAWL_OUT —
 #      the upload subcommand has no --db/--out flags; it reads status=done,
