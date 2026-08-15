@@ -232,9 +232,17 @@ func usageErr(msg string) error { return fmt.Errorf("usage: %s", msg) }
 // "add kind url --name X" and "add --name X kind url".
 func reorderArgs(args []string, boolFlags map[string]bool) []string {
 	var flags, pos []string
+	afterDash := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if strings.HasPrefix(a, "-") && a != "-" {
+		if a == "--" {
+			// everything after '--' is positional — including args that
+			// start with '-' (e.g. set-topics 22 -- -interview,-panel)
+			afterDash = true
+			flags = append(flags, a)
+			continue
+		}
+		if !afterDash && strings.HasPrefix(a, "-") && a != "-" {
 			flags = append(flags, a)
 			if !boolFlags[strings.TrimLeft(a, "-")] && i+1 < len(args) {
 				flags = append(flags, args[i+1])

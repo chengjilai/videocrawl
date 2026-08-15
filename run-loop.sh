@@ -25,6 +25,9 @@
 cd "$HOME/videocrawl" || exit 1
 export VIDEOCRAWL_WARP_SOCKS=off VIDEOCRAWL_NO_PROXY_CHECK=1
 export VIDEOCRAWL_PROXY=http://127.0.0.1:18888
+# transcript gate: 0.15 → 0.2 (2026-08-15: the 0.15 floor let 2012-era
+# generic talks through; 0.2 keeps the precision layer meaningful)
+export VIDEOCRAWL_TRANSCRIPT_THRESHOLD=0.2
 # VIDEOCRAWL_EMBED_URL: the lab embedding server (Qwen3-Embedding-0.6B);
 # the crawler falls back to TF-IDF scoring if it is down.
 export VIDEOCRAWL_EMBED_URL=http://127.0.0.1:8700/embed
