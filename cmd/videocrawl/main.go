@@ -114,11 +114,13 @@ func main() {
 		workers := fs.Int("workers", 6, "parallel downloads (lab: egress-bound, default 6)")
 		rounds := fs.Int("rounds", 0, "0 = run forever")
 		maxTime := fs.Int("max-time", 0, "per-round time budget in seconds (0=unlimited)")
+		autoSeed := fs.Int("auto-seed", 0, "seed the top-N corpus-discovery hits into the discover source each --auto-seed-every rounds (0 = off)")
+		autoSeedEvery := fs.Int("auto-seed-every", 24, "rounds between auto-seed passes (loop cadence * rounds ≈ daily at --every 3600)")
 		minDur := fs.Int64("min-dur", 60, "min video seconds")
 		maxDur := fs.Int64("max-dur", 7200, "max video seconds")
 		fs.Parse(reorderArgs(args, map[string]bool{}))
 		policy := dl.Policy{MinDuration: *minDur, MaxDuration: *maxDur, SkipShorts: true, SkipLive: true}
-		err = a.CrawlLoop(ctx, *every, *limit, *workers, *rounds, time.Duration(*maxTime)*time.Second, policy)
+		err = a.CrawlLoop(ctx, *every, *limit, *workers, *rounds, time.Duration(*maxTime)*time.Second, policy, *autoSeed, *autoSeedEvery)
 	case "upload":
 		fs := flag.NewFlagSet("upload", flag.ExitOnError)
 		limit := fs.Int("limit", 0, "max videos this pass (0=all done)")

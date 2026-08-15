@@ -632,7 +632,13 @@ func (a *App) Download(ctx context.Context, limit, workers int, policy dl.Policy
 
 // ---- crawl-loop ----
 
-func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds int, maxTime time.Duration, policy dl.Policy) error {
+// autoSeedDue: the pass runs on round 1 and then every autoSeedEvery rounds
+// (the loop's cadence is `every` seconds, so 24 rounds ≈ daily).
+func autoSeedDue(round, every int) bool {
+	return every > 0 && (round-1)%every == 0
+}
+
+func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds int, maxTime time.Duration, policy dl.Policy, autoSeed, autoSeedEvery int) error {
 	if err := dl.EnsureDir(a.OutDir); err != nil {
 		return err
 	}
@@ -654,6 +660,11 @@ func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds i
 		} else {
 			if err := a.Enumerate(ctx, 2, 0, 0, deadline); err != nil {
 				fmt.Fprintf(os.Stderr, "enumerate: %v\n", err)
+			}
+			// channel-free find: one corpus-driven discovery pass, seeded into
+			// the discover source (scored rows jump the download queue).
+			if autoSeedDue(round, autoSeedEvery) {
+				a.autoSeed(ctx, autoSeed)
 			}
 			// (1) disk headroom before the download pass.
 			if err := checkDiskFree(a.OutDir); err != nil {

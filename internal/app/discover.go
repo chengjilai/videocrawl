@@ -426,73 +426,25 @@ func (a *App) discoverRun(ctx context.Context, o DiscoverOpts) error {
 	if o.HNMinPoints <= 0 {
 		o.HNMinPoints = 50
 	}
-	corpusTitles := a.loadCorpusTitles()
-	queries := GenerateQueries(corpusTitles, o.Queries...)
-	if len(corpusTitles) == 0 && len(o.Queries) == 0 {
+	if len(a.loadCorpusTitles()) == 0 && len(o.Queries) == 0 {
 		return fmt.Errorf("discover: no corpus at config/semantic-corpus.json and no --query given")
-	}
-	if len(corpusTitles) == 0 {
-		fmt.Fprintln(os.Stderr, "discover: warning: corpus missing — using --query only")
 	}
 	st, err := a.open()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	knownURLs, knownIDs, err := knownVideoSets(st)
-	if err != nil {
-		return err
-	}
-	g := newGates(a.loadCorpus(), corpusTitles, knownURLs, knownIDs, o)
-	lim := politeness.New(1500 * time.Millisecond)
-
-	var results []candidate
-	seen := map[string]bool{}
-	emit := func(c candidate) {
-		if seen[c.URL] {
-			return
-		}
-		seen[c.URL] = true
-		results = append(results, c)
-	}
 	var seeds, leads []hnLine
 	seedLine := func(url, title string) { seeds = append(seeds, hnLine{url, title}) }
 	leadLine := func(url, title string) { leads = append(leads, hnLine{url, title}) }
-
-	for _, src := range o.Sources {
-		for _, q := range queries {
-			if dl.Expired(ctx, time.Time{}) {
-				break
-			}
-			var err error
-			switch src {
-			case "yt":
-				err = a.discoverYT(ctx, g, lim, q, o.PerQuery, emit)
-			case "hn":
-				err = a.discoverHN(ctx, g, lim, q, o, emit, seedLine, leadLine)
-			case "ccc":
-				err = a.discoverCCC(ctx, g, lim, q, o.PerQuery, emit)
-			default:
-				return fmt.Errorf("discover: unknown source %q (want yt, hn, ccc)", src)
-			}
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "discover %s %q: %v\n", src, q, err)
-			}
-		}
+	results, err := a.discoverResults(ctx, o, seedLine, leadLine)
+	if err != nil {
+		return err
 	}
-
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Score != results[j].Score {
-			return results[i].Score > results[j].Score
-		}
-		if results[i].Source != results[j].Source {
-			return results[i].Source < results[j].Source
-		}
-		return results[i].Title < results[j].Title
-	})
-	if len(results) > o.Limit {
-		results = results[:o.Limit]
-	}
+	// the transcripts stage needs its own gates/limiter (discoverResults
+	// builds and discards its own).
+	lim := politeness.New(1500 * time.Millisecond)
+	g := newGates(a.loadCorpus(), a.loadCorpusTitles(), nil, nil, o)
 
 	if o.JSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -575,6 +527,108 @@ func (a *App) discoverRun(ctx context.Context, o DiscoverOpts) error {
 // entries lack upload_date and shorts/live status, so the survivors
 // (top per-query by preliminary score) get one GetMeta each: that yields
 // duration/media_type/live_status/channel; shorts and live streams drop.
+// discoverResults runs the configured backends over the generated queries
+// (corpus-driven: speakers, conferences, topics) and returns the ranked,
+// limit-truncated candidate list. Shared by the discover command and the
+// crawl-loop's auto-seed pass. seedLine/leadLine receive HN channel/playlist
+// suggestions (may be nil — auto-seed does not need them).
+func (a *App) discoverResults(ctx context.Context, o DiscoverOpts, seedLine, leadLine func(url, title string)) ([]candidate, error) {
+	corpusTitles := a.loadCorpusTitles()
+	queries := GenerateQueries(corpusTitles, o.Queries...)
+	if len(corpusTitles) == 0 && len(o.Queries) == 0 {
+		return nil, fmt.Errorf("no corpus at config/semantic-corpus.json and no --query given")
+	}
+	st, err := a.open()
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	knownURLs, knownIDs, err := knownVideoSets(st)
+	if err != nil {
+		return nil, err
+	}
+	g := newGates(a.loadCorpus(), corpusTitles, knownURLs, knownIDs, o)
+	lim := politeness.New(1500 * time.Millisecond)
+
+	var results []candidate
+	seen := map[string]bool{}
+	emit := func(c candidate) {
+		if seen[c.URL] {
+			return
+		}
+		seen[c.URL] = true
+		results = append(results, c)
+	}
+
+	for _, src := range o.Sources {
+		for _, q := range queries {
+			if dl.Expired(ctx, time.Time{}) {
+				break
+			}
+			var err error
+			switch src {
+			case "yt":
+				err = a.discoverYT(ctx, g, lim, q, o.PerQuery, emit)
+			case "hn":
+				err = a.discoverHN(ctx, g, lim, q, o, emit, seedLine, leadLine)
+			case "ccc":
+				err = a.discoverCCC(ctx, g, lim, q, o.PerQuery, emit)
+			default:
+				return nil, fmt.Errorf("unknown source %q (want yt, hn, ccc)", src)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "discover %s %q: %v\n", src, q, err)
+			}
+		}
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		if results[i].Source != results[j].Source {
+			return results[i].Source < results[j].Source
+		}
+		return results[i].Title < results[j].Title
+	})
+	if len(results) > o.Limit {
+		results = results[:o.Limit]
+	}
+	return results, nil
+}
+
+// autoSeed runs one corpus-driven discovery pass and queues the top-N
+// candidates into the discover source (the crawl-loop's --auto-seed).
+// Bounded by a 10-minute budget; failures are logged, never fatal — the
+// loop keeps going with whatever it has (and the TF-IDF fallback applies
+// if the embedding server is down).
+func (a *App) autoSeed(ctx context.Context, n int) {
+	o := DiscoverOpts{Limit: n, PerQuery: 4, HNMinPoints: 20, Sources: []string{"yt", "hn"}}
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	results, err := a.discoverResults(sctx, o, nil, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-seed: %v\n", err)
+		return
+	}
+	if len(results) == 0 {
+		fmt.Println("auto-seed: no candidates above the gate")
+		return
+	}
+	st, err := a.open()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-seed: %v\n", err)
+		return
+	}
+	defer st.Close()
+	srcID, queued, err := a.seedResults(st, results, n)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-seed: %v\n", err)
+		return
+	}
+	fmt.Printf("auto-seed: seeded %d new candidate(s) into source #%d (kind discover)\n", queued, srcID)
+}
+
 func (a *App) discoverYT(ctx context.Context, g *gates, lim *politeness.Limiter, q string, perQuery int, emit func(candidate)) error {
 	cfg := a.sites()["youtube"]
 	proxy := sites.ProxyURL(cfg)

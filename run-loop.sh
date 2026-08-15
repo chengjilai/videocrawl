@@ -31,4 +31,8 @@ export VIDEOCRAWL_EMBED_URL=http://127.0.0.1:8700/embed
 export VIDEOCRAWL_OUT="$HOME/Videos/Crawl"
 export VIDEOCRAWL_DB="$HOME/videocrawl/videocrawl.db"
 export VIDEOCRAWL_COOKIES_DIR="$HOME/videocrawl/cookies"
-exec ./videocrawl crawl-loop --every 3600 --limit 8 --workers 6 --max-time 3000
+# --auto-seed 5 --auto-seed-every 24: one corpus-driven discovery pass per
+# day (24 hourly rounds), top-5 hits seeded into the 'discover' source —
+# scored rows jump the download queue and upload via the 'disc' allowlist.
+exec ./videocrawl crawl-loop --every 3600 --limit 8 --workers 6 --max-time 3000 \
+  --auto-seed 5 --auto-seed-every 24
