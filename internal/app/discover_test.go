@@ -227,7 +227,7 @@ func gateTestApp(t *testing.T) (*App, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertVideo(model.Video{
+	if _, err := st.UpsertVideo(model.Video{
 		SourceID: srcID, VideoID: "known1",
 		URL: "https://www.youtube.com/watch?v=known1", Title: "Already Queued",
 	}); err != nil {

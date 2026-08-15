@@ -8,6 +8,8 @@ package app
 import (
 	"sort"
 	"strings"
+
+	"videocrawl/internal/score"
 )
 
 // SpeakerNames extracts corpus speaker FULL NAMES from the credits after
@@ -21,7 +23,7 @@ func SpeakerNames(corpusTitles []string) []string {
 	names := map[string]string{}
 	for _, t := range corpusTitles {
 		for _, seg := range splitCredits(t) {
-			toks := tokenizeCorpus([]string{seg})
+			toks := segmentTokens(seg)
 			for i := 0; i+1 < len(toks); i++ {
 				a, b := toks[i], toks[i+1]
 				if !a.capped || !b.capped || a.lower == b.lower {
@@ -44,6 +46,33 @@ func SpeakerNames(corpusTitles []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// segmentTokens: the corpus tokenizer applied to ONE credit segment IN
+// TITLE ORDER. tokenizeCorpus is not usable here: it returns tokens in map
+// order (nondeterministic), which would pair non-adjacent words into bogus
+// names ("Garnacho Carlos") and randomly drop real ones. Same filters as
+// tokenizeCorpus: len>=2, STOPWORDS dropped, case-preserving, dedup per
+// segment, capped = any occurrence capitalized.
+func segmentTokens(seg string) []corpusToken {
+	pos := map[string]int{}
+	var toks []corpusToken
+	for _, raw := range qTokRe.FindAllString(seg, -1) {
+		low := strings.ToLower(raw)
+		if len(low) < 2 || score.STOPWORDS[low] {
+			continue
+		}
+		capped := raw[0] >= 'A' && raw[0] <= 'Z'
+		if i, ok := pos[low]; ok {
+			if capped {
+				toks[i].capped = true
+			}
+			continue
+		}
+		pos[low] = len(toks)
+		toks = append(toks, corpusToken{lower: low, display: raw, capped: capped})
+	}
+	return toks
 }
 
 // splitCredits splits a title into the segment after each credit separator

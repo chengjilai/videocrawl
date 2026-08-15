@@ -73,6 +73,7 @@ func (s *Store) init() error {
 			sha256 TEXT NOT NULL DEFAULT '',
 			bvid TEXT NOT NULL DEFAULT '',
 			fetched_at TEXT NOT NULL DEFAULT '',
+			score REAL NOT NULL DEFAULT 0,
 			PRIMARY KEY (source_id, video_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status, published)`,
@@ -111,6 +112,11 @@ func (s *Store) init() error {
 	// migration: transcript_score (relevance gate) postdates the original
 	// schema too; default 0 = unscored/no transcript.
 	if err := s.ensureColumn("videos", "transcript_score", "REAL NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	// migration: score (discover relevance ranking) postdates the original
+	// schema too; default 0 = unscored (legacy rows keep oldest-first order).
+	if err := s.ensureColumn("videos", "score", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
 	if err := s.ensureColumn("sources", "topics", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -230,13 +236,13 @@ func (s *Store) SetSourceEnum(srcID int64, count int64, complete bool) error {
 // ---- videos ----
 
 // UpsertVideo inserts a discovered video or no-ops if known (PK dedup).
-func (s *Store) UpsertVideo(v model.Video) error {
-	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO videos (source_id,video_id,url,title,duration,published,channel,status,fetched_at)
-		 VALUES (?,?,?,?,?,?,?,?,?)`,
+// Returns the result (RowsAffected tells callers whether the row was new).
+func (s *Store) UpsertVideo(v model.Video) (sql.Result, error) {
+	return s.db.Exec(
+		`INSERT OR IGNORE INTO videos (source_id,video_id,url,title,duration,published,channel,status,score,fetched_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		v.SourceID, v.VideoID, v.URL, v.Title, v.Duration, v.Published, v.Channel,
-		model.StatusNew, time.Now().UTC().Format(time.RFC3339))
-	return err
+		model.StatusNew, v.Score, time.Now().UTC().Format(time.RFC3339))
 }
 
 // UpsertFiles records native-download candidate files for a video.
@@ -293,14 +299,15 @@ func (s *Store) UpsertMediaFiles(srcID int64, videoID string, files []model.Medi
 	return tx.Commit()
 }
 
-// NextForDownload returns up to n videos ready to process, oldest published
-// first (TubeSync lesson: oldest-first so a slow queue doesn't starve old
-// videos; also makes the crawl time-unbiased). minDur/maxDur (seconds;
-// 0 = unset) pre-filter on the KNOWN duration so videos that would only be
-// skipped later don't burn queue/limit slots. duration=0 (unknown) always
-// passes.
+// NextForDownload returns up to n videos ready to process: scored rows
+// (discover candidates) first in relevance order (score desc), then unscored
+// rows oldest published first (TubeSync lesson: oldest-first so a slow queue
+// doesn't starve old videos; also makes the crawl time-unbiased).
+// minDur/maxDur (seconds; 0 = unset) pre-filter on the KNOWN duration so
+// videos that would only be skipped later don't burn queue/limit slots.
+// duration=0 (unknown) always passes.
 func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, error) {
-	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score,score
 		 FROM videos WHERE status IN ('new','failed') AND attempts < 5`
 	var args []any
 	if minDur > 0 || maxDur > 0 {
@@ -315,7 +322,7 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 		}
 		q += `)`
 	}
-	q += ` ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`
+	q += ` ORDER BY (score>0) DESC, score DESC, (published='') ASC, published ASC, source_id, video_id LIMIT ?`
 	args = append(args, n)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -327,7 +334,7 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore, &v.Score); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -335,13 +342,14 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 	return out, rows.Err()
 }
 
-// NextForUpload returns up to n downloaded videos not yet republished,
-// oldest published first (same order as the download queue, so the oldest
-// content leaves the frontier first).
+// NextForUpload returns up to n downloaded videos not yet republished:
+// scored rows first in relevance order (score desc), then unscored rows
+// oldest published first (same relative order as the download queue, so the
+// oldest content leaves the frontier first).
 func (s *Store) NextForUpload(n int) ([]model.Video, error) {
 	rows, err := s.db.Query(
-		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score
-		 FROM videos WHERE status=? ORDER BY (published='') ASC, published ASC, source_id, video_id LIMIT ?`,
+		`SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score,score
+		 FROM videos WHERE status=? ORDER BY (score>0) DESC, score DESC, (published='') ASC, published ASC, source_id, video_id LIMIT ?`,
 		model.StatusDone, n)
 	if err != nil {
 		return nil, err
@@ -352,7 +360,7 @@ func (s *Store) NextForUpload(n int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore, &v.Score); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -388,7 +396,7 @@ func (s *Store) CountByStatus() (map[string]int64, error) {
 
 // VideoRows lists videos filtered by status ("" = all).
 func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
-	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score FROM videos`
+	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score,score FROM videos`
 	var args []any
 	if status != "" {
 		q += ` WHERE status=?`
@@ -406,7 +414,7 @@ func (s *Store) VideoRows(status string, limit int) ([]model.Video, error) {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
 			&v.Published, &v.Channel, &v.Status, &v.Attempts, &v.LastError,
-			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore); err != nil {
+			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore, &v.Score); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -483,6 +491,8 @@ func siteFor(kind string) string {
 		return "gallica"
 	case model.KindRSS:
 		return "rss"
+	case model.KindDiscover:
+		return "youtube"
 	}
 	return ""
 }

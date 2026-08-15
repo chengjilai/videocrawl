@@ -3,8 +3,11 @@
 // requested backends (yt search / HN Algolia / media.ccc.de search), gated
 // (dedup vs the videos table + corpus duplicates, topic filter, semantic
 // title gate, latin script, shorts/live, speaker boost), ranked, and
-// printed as a table. READ-ONLY: no DB writes, no downloads — the handoff
-// is 'videocrawl add youtube-playlist <url>' for a single talk.
+// printed as a table. With --seed N the top-N ranked candidates are queued
+// into a 'discover' source (lazily created, idempotent) so the crawl-loop
+// downloads them in relevance order; `upload --upload-allowlist disc`
+// republishes them. Without --seed the handoff is
+// 'videocrawl add youtube-playlist <url>' for a single talk.
 package app
 
 import (
@@ -23,6 +26,7 @@ import (
 
 	"videocrawl/internal/dl"
 	"videocrawl/internal/enum"
+	"videocrawl/internal/model"
 	"videocrawl/internal/politeness"
 	"videocrawl/internal/score"
 	"videocrawl/internal/sites"
@@ -40,6 +44,7 @@ type DiscoverOpts struct {
 	HNMinPoints  int      // HN story points floor
 	PerQuery     int      // candidate cap per query (ytsearch depth, finalists)
 	Transcripts  int      // transcript-check the top N survivors (0 = off)
+	Seed         int      // --seed N: queue the top-N ranked candidates into the discover source (0 = off)
 	IncludeKnown bool     // show already-known/off-profile hits instead of dropping
 	JSON         bool     // JSONL output
 }
@@ -65,6 +70,7 @@ func Discover(ctx context.Context, args []string) error {
 	hnMin := fs.Int("hn-min-points", 50, "HN story points floor")
 	perQuery := fs.Int("per-query", 10, "candidate cap per query")
 	transcripts := fs.Int("transcripts", 0, "fetch auto-subs + transcript-score the top N survivors (0 = off)")
+	seed := fs.Int("seed", 0, "queue the top-N ranked candidates into the discover source for the crawl-loop (0 = off)")
 	includeKnown := fs.Bool("include-known", false, "show already-known/off-profile hits instead of dropping")
 	jsonOut := fs.Bool("json", false, "JSONL output")
 	fs.Parse(args)
@@ -88,6 +94,7 @@ func Discover(ctx context.Context, args []string) error {
 		HNMinPoints:  *hnMin,
 		PerQuery:     *perQuery,
 		Transcripts:  *transcripts,
+		Seed:         *seed,
 		IncludeKnown: *includeKnown,
 		JSON:         *jsonOut,
 	})
@@ -328,6 +335,44 @@ type hnLine struct {
 	title string
 }
 
+// discoverSeedURL: sentinel URL for the single discover source (AddSource
+// dedups by (url,query) so seeding is idempotent).
+const discoverSeedURL = "discover://topic-search"
+
+// seedResults: queue the top-N ranked candidates into the single discover
+// source (lazily created; idempotent). Each row carries the candidate's
+// semantic score so the download/upload queues pull it in relevance order.
+// INSERT OR IGNORE: first row wins — existing rows keep their status
+// (failed/done rows are not resurrected). Returns the source id and the
+// number of NEW rows inserted.
+func (a *App) seedResults(st *store.Store, results []candidate, n int) (int64, int, error) {
+	srcID, err := st.AddSource(model.KindDiscover, discoverSeedURL, "", "discover", "")
+	if err != nil {
+		return 0, 0, err
+	}
+	queued := 0
+	for _, c := range results[:n] {
+		res, err := st.UpsertVideo(model.Video{
+			SourceID: srcID,
+			VideoID:  c.VideoID,
+			URL:      c.URL,
+			Title:    c.Title,
+			Duration: c.Duration,
+			Channel:  c.Channel,
+			Score:    c.Score,
+		})
+		if err != nil {
+			return srcID, queued, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return srcID, queued, err
+		}
+		queued += int(affected)
+	}
+	return srcID, queued, nil
+}
+
 // discoverRun: the full pipeline — queries, backends, gates, ranking,
 // transcript stage, output.
 func (a *App) discoverRun(ctx context.Context, o DiscoverOpts) error {
@@ -446,7 +491,7 @@ func (a *App) discoverRun(ctx context.Context, o DiscoverOpts) error {
 			fmt.Printf("%3d  %-6s  %-3s  %-22s  %s / %s\n",
 				i+1, scoreCell, c.Source, trunc(c.Channel, 22), trunc(title, 60), c.URL)
 		}
-		if len(results) > 0 {
+		if len(results) > 0 && o.Seed <= 0 {
 			fmt.Println("hint: add a single talk with: videocrawl add youtube-playlist <url>")
 		}
 	}
@@ -458,6 +503,25 @@ func (a *App) discoverRun(ctx context.Context, o DiscoverOpts) error {
 		}
 		if err := a.discoverTranscripts(ctx, g, lim, results[:n], o.JSON); err != nil {
 			fmt.Fprintf(os.Stderr, "discover: transcripts: %v\n", err)
+		}
+	}
+
+	if o.Seed > 0 && len(results) > 0 {
+		n := o.Seed
+		if n > len(results) {
+			n = len(results)
+		}
+		srcID, queued, err := a.seedResults(st, results, n)
+		if err != nil {
+			// seed failure must fail the run (exit != 0): a --json consumer
+			// would otherwise see no "seeded" record and cannot detect it.
+			return fmt.Errorf("seed: %w", err)
+		}
+		if o.JSON {
+			json.NewEncoder(os.Stdout).Encode(map[string]any{"kind": "seeded", "source_id": srcID, "queued": queued, "candidates": n})
+		} else {
+			fmt.Printf("seeded %d new candidate(s) into source #%d (kind discover); crawl-loop downloads them in relevance order\n", queued, srcID)
+			fmt.Println("hint: allow uploads with: videocrawl upload --upload-allowlist disc")
 		}
 	}
 	return nil

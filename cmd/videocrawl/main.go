@@ -23,8 +23,11 @@
 //	search <query> [--seed]       archive.org PD music search (find logic)
 //	discover [--limit N] [--query Q]... [--sources yt,hn,ccc]
 //	         [--threshold F] [--topics kw1,-kw2] [--hn-min-points N]
-//	         [--per-query N] [--transcripts N] [--include-known] [--json]
-//	                             corpus-driven discovery of new talks (read-only)
+//	         [--per-query N] [--transcripts N] [--include-known] [--seed N] [--json]
+//	                             corpus-driven discovery of new talks; --seed N
+//	                             queues the top-N hits into the discover source
+//	                             (crawl-loop downloads in relevance order;
+//	                             'upload --upload-allowlist disc' republishes)
 package main
 
 import (
@@ -120,7 +123,7 @@ func main() {
 		fs := flag.NewFlagSet("upload", flag.ExitOnError)
 		limit := fs.Int("limit", 0, "max videos this pass (0=all done)")
 		dryRun := fs.Bool("dry-run", false, "print the would-upload list only")
-		allowlist := fs.String("upload-allowlist", "", "'cc' (CC BY, site=ccc) or comma list of source ids; REQUIRED (licensing gate)")
+		allowlist := fs.String("upload-allowlist", "", "'cc' (CC BY, site=ccc), 'pt' (peertube), 'disc' (discover) or comma list of source ids; REQUIRED (licensing gate)")
 		rewrite := fs.String("path-prefix-rewrite", "", "OLD:NEW — rewrite videos.path prefix (lab->aturing sync)")
 		fs.Parse(reorderArgs(args, map[string]bool{"dry-run": true}))
 		err = a.Upload(*limit, *dryRun, *allowlist, *rewrite, a.OutDir)
@@ -169,9 +172,10 @@ func usage() {
   download  [--limit N] [--workers W] [--min-dur S] [--max-dur S]
             [--skip-shorts] [--skip-live]
   crawl-loop [--every SEC] [--limit N] [--workers W] [--rounds N] [--max-time SEC]
-  upload [--limit N] [--dry-run] --upload-allowlist 'cc'|IDs [--path-prefix-rewrite OLD:NEW]
+  upload [--limit N] [--dry-run] --upload-allowlist 'cc'|'pt'|'disc'|IDs [--path-prefix-rewrite OLD:NEW]
       republish done videos to bilibili; --upload-allowlist is mandatory:
-      'cc' = media.ccc.de (CC BY) sources, or a comma list of source ids
+      'cc' = media.ccc.de (CC BY) sources, 'pt' = peertube, 'disc' = discover
+      sources, or a comma list of source ids
   post-loop [--every SEC] [--limit N] [--dry-run] [--check-bili] [--no-upload|--upload-only]
       [--seed ID[:T],...] [--video-dir DIR]
       PD-gated auto download+repost loop for music (archive.org → bilibili;
@@ -182,12 +186,14 @@ func usage() {
   search <query> [--seed]      archive.org PD music search (the music find)
   discover [--limit N] [--query Q]... [--sources yt,hn,ccc]
       [--threshold F] [--topics kw1,-kw2] [--hn-min-points N]
-      [--per-query N] [--transcripts N] [--include-known] [--json]
-      corpus-driven discovery of new talks (read-only): queries are
+      [--per-query N] [--transcripts N] [--include-known] [--seed N] [--json]
+      corpus-driven discovery of new talks: queries are
       generated from the uploaded-talk corpus (config/semantic-corpus.json)
       and run through youtube search / HN / media.ccc.de; results are gated
       (dedup, topics, semantic score, shorts/live, speaker boost) and ranked.
-      No DB writes, no downloads — add a hit with
+      --seed N queues the top-N hits into the discover source (crawl-loop
+      downloads them in relevance order; 'upload --upload-allowlist disc'
+      republishes). Without --seed, add a hit with
       'videocrawl add youtube-playlist <url>' (works for a single talk)
   status                      sources + queue counts
   list [--status X] [--json] [--limit N]

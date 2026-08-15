@@ -22,7 +22,7 @@ func newTestStore(t *testing.T) *Store {
 
 func insVideo(t *testing.T, s *Store, v model.Video) {
 	t.Helper()
-	if err := s.UpsertVideo(v); err != nil {
+	if _, err := s.UpsertVideo(v); err != nil {
 		t.Fatalf("UpsertVideo(%d/%s): %v", v.SourceID, v.VideoID, err)
 	}
 }
@@ -67,7 +67,7 @@ func setVideoState(t *testing.T, s *Store, srcID int64, videoID, status string, 
 // same video no-ops; the first row wins.
 func TestUpsertVideoDedup(t *testing.T) {
 	s := newTestStore(t)
-	insVideo(t, s, model.Video{SourceID: 1, VideoID: "abc", URL: "https://youtu.be/abc", Title: "original"})
+	insVideo(t, s, model.Video{SourceID: 1, VideoID: "abc", URL: "https://youtu.be/abc", Title: "original", Score: 0.42})
 	// same PK, different payload — INSERT OR IGNORE must keep the first row
 	insVideo(t, s, model.Video{SourceID: 1, VideoID: "abc", URL: "https://youtu.be/other", Title: "changed"})
 
@@ -86,6 +86,9 @@ func TestUpsertVideoDedup(t *testing.T) {
 	}
 	if rows[0].Status != model.StatusNew {
 		t.Errorf("status=%q, want new", rows[0].Status)
+	}
+	if rows[0].Score != 0.42 {
+		t.Errorf("score=%v, want 0.42 (roundtrip)", rows[0].Score)
 	}
 	// same video id under a different source is a different row (PK is composite)
 	insVideo(t, s, model.Video{SourceID: 2, VideoID: "abc", URL: "https://youtu.be/abc"})
@@ -135,6 +138,43 @@ func TestNextForDownloadOrdering(t *testing.T) {
 	insVideo(t, s, v("h2023", "2023-01-01", model.StatusNew, 0))
 	if got3, _ := s.NextForDownload(10, 0, 0); got3[1].VideoID != "b2023" || got3[2].VideoID != "h2023" {
 		t.Fatalf("tiebreak: %v", ids(got3))
+	}
+}
+
+// TestNextForDownloadScoreOrdering: scored rows (discover candidates) come
+// first in relevance order (score desc), then unscored rows oldest published
+// first; LIMIT is honored.
+func TestNextForDownloadScoreOrdering(t *testing.T) {
+	s := newTestStore(t)
+	v := func(id, published string, score float64) model.Video {
+		return model.Video{SourceID: 1, VideoID: id, URL: "u/" + id, Published: published, Score: score}
+	}
+	insVideo(t, s, v("s90", "2020-01-01", 0.9))
+	insVideo(t, s, v("s5025", "2025-01-01", 0.5))
+	insVideo(t, s, v("s50u", "", 0.5))
+	insVideo(t, s, v("u2023", "2023-01-01", 0))
+	insVideo(t, s, v("uu", "", 0))
+
+	got, err := s.NextForDownload(10, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"s90", "s5025", "s50u", "u2023", "uu"}
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, ids(got))
+	}
+	for i, w := range want {
+		if got[i].VideoID != w {
+			t.Fatalf("order[%d] = %s, want %s (all: %v)", i, got[i].VideoID, w, ids(got))
+		}
+	}
+	// scores survive the roundtrip
+	if got[0].Score != 0.9 || got[1].Score != 0.5 {
+		t.Errorf("score roundtrip: %v %v", got[0].Score, got[1].Score)
+	}
+	// LIMIT is honored
+	if got2, _ := s.NextForDownload(2, 0, 0); len(got2) != 2 || got2[0].VideoID != "s90" || got2[1].VideoID != "s5025" {
+		t.Fatalf("limit 2: %v", ids(got2))
 	}
 }
 
@@ -259,6 +299,42 @@ func TestNextForUpload(t *testing.T) {
 	}
 }
 
+// TestNextForUploadScoreOrdering: same relevance-first ordering as the
+// download queue — scored done rows in score-desc order, then unscored
+// oldest published first.
+func TestNextForUploadScoreOrdering(t *testing.T) {
+	s := newTestStore(t)
+	v := func(id, published string, score float64) model.Video {
+		return model.Video{SourceID: 1, VideoID: id, URL: "u/" + id, Published: published, Score: score}
+	}
+	insVideo(t, s, v("s90", "2020-01-01", 0.9))
+	insVideo(t, s, v("s5025", "2025-01-01", 0.5))
+	insVideo(t, s, v("s50u", "", 0.5))
+	insVideo(t, s, v("u2023", "2023-01-01", 0))
+	insVideo(t, s, v("uu", "", 0))
+	for _, id := range []string{"s90", "s5025", "s50u", "u2023", "uu"} {
+		setVideoState(t, s, 1, id, model.StatusDone, 0)
+	}
+
+	got, err := s.NextForUpload(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"s90", "s5025", "s50u", "u2023", "uu"}
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, ids(got))
+	}
+	for i, w := range want {
+		if got[i].VideoID != w {
+			t.Fatalf("order[%d] = %s, want %s (all: %v)", i, got[i].VideoID, w, ids(got))
+		}
+	}
+	// LIMIT is honored
+	if got2, _ := s.NextForUpload(2); len(got2) != 2 || got2[0].VideoID != "s90" || got2[1].VideoID != "s5025" {
+		t.Fatalf("limit 2: %v", ids(got2))
+	}
+}
+
 // TestUploadMarked: sets status=uploaded + bvid; the video leaves both the
 // upload queue and the download queue.
 func TestUploadMarked(t *testing.T) {
@@ -332,6 +408,14 @@ func TestBvidMigration(t *testing.T) {
 	v = getOne(t, s, 1, "old")
 	if v.TranscriptScore != 0.7 {
 		t.Errorf("migrated transcript_score = %v, want 0.7", v.TranscriptScore)
+	}
+	// score is migrated too (default 0) and writable/readable via UpsertVideo
+	if _, err := s.UpsertVideo(model.Video{SourceID: 2, VideoID: "scored", URL: "u/scored", Score: 0.33}); err != nil {
+		t.Fatalf("UpsertVideo on migrated DB: %v", err)
+	}
+	v = getOne(t, s, 2, "scored")
+	if v.Score != 0.33 {
+		t.Errorf("migrated score = %v, want 0.33", v.Score)
 	}
 }
 

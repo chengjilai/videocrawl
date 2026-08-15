@@ -135,7 +135,7 @@ func TestGateTranscript(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.UpsertVideo(model.Video{SourceID: 1, VideoID: "zzz", URL: "u/zzz"}); err != nil {
+	if _, err := st.UpsertVideo(model.Video{SourceID: 1, VideoID: "zzz", URL: "u/zzz"}); err != nil {
 		t.Fatal(err)
 	}
 	p = &Pool{store: st, outDir: dir, scorer: score.NewSemanticScorer(corpus), transcriptThreshold: 0.99}

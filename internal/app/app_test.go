@@ -1,14 +1,18 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"videocrawl/internal/model"
+	"videocrawl/internal/politeness"
+	"videocrawl/internal/sites"
 	"videocrawl/internal/store"
 )
 
@@ -257,7 +261,7 @@ func uploadTestApp(t *testing.T, kind, url, channel string) (*App, *store.Store,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertVideo(model.Video{SourceID: srcID, VideoID: "vid1", URL: url, Title: "Talk Title", Channel: channel}); err != nil {
+	if _, err := st.UpsertVideo(model.Video{SourceID: srcID, VideoID: "vid1", URL: url, Title: "Talk Title", Channel: channel}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.MarkDownloaded(model.Video{SourceID: srcID, VideoID: "vid1", Title: "Talk Title",
@@ -286,8 +290,130 @@ func TestParseUploadAllowlist(t *testing.T) {
 	if !g.allows(model.Source{ID: 3, Site: "youtube"}) || !g.allows(model.Source{ID: 7}) || g.allows(model.Source{ID: 4}) {
 		t.Errorf("id list: got %+v", g)
 	}
+	// 'disc' allows discover-kind sources only (site youtube underneath)
+	g, err = parseUploadAllowlist("disc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.allows(model.Source{ID: 1, Kind: model.KindDiscover, Site: "youtube"}) {
+		t.Errorf("'disc' must allow discover sources")
+	}
+	if g.allows(model.Source{ID: 1, Kind: model.KindYoutubeChannel, Site: "youtube"}) ||
+		g.allows(model.Source{ID: 1, Kind: model.KindCCCConf, Site: "ccc"}) ||
+		g.allows(model.Source{ID: 1, Kind: model.KindRSS, Site: "rss"}) {
+		t.Errorf("'disc' leaked to other kinds")
+	}
+	// 'cc,disc' combo: both classes pass, anything else still refuses
+	g, err = parseUploadAllowlist("cc,disc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.allows(model.Source{ID: 1, Site: "ccc"}) || !g.allows(model.Source{ID: 1, Kind: model.KindDiscover, Site: "youtube"}) {
+		t.Errorf("'cc,disc' combo: %+v", g)
+	}
+	if g.allows(model.Source{ID: 1, Kind: model.KindYoutubeChannel, Site: "youtube"}) {
+		t.Errorf("'cc,disc' must not allow youtube-channel")
+	}
 	if _, err := parseUploadAllowlist("cc,bogus"); err == nil {
 		t.Fatal("non-numeric token must be rejected")
+	}
+	// the unknown-token error advertises 'disc'
+	if _, err := parseUploadAllowlist("bogus"); err == nil || !strings.Contains(err.Error(), "disc") {
+		t.Errorf("unknown token err = %v, want mention of 'disc'", err)
+	}
+}
+
+// TestDiscoverSeed: seedResults queues ranked candidates into the lazily
+// created discover source (kind/site/URL pinned) with their scores; re-seeding
+// is idempotent (same source id, zero new rows).
+func TestDiscoverSeed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "vc.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	a := &App{DBPath: dbPath}
+	cands := []candidate{
+		{Source: "yt", URL: "https://www.youtube.com/watch?v=abcdefghijk", VideoID: "abcdefghijk", Title: "Talk A", Channel: "C1", Score: 0.9},
+		{Source: "ccc", URL: "https://media.ccc.de/v/37c3-123", VideoID: "37c3-123", Title: "Talk B", Channel: "C2", Score: 0.4},
+	}
+	srcID, queued, err := a.seedResults(st, cands, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 2 {
+		t.Fatalf("queued = %d, want 2", queued)
+	}
+	src, err := st.GetSource(srcID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.Kind != model.KindDiscover || src.Site != "youtube" || src.URL != discoverSeedURL {
+		t.Errorf("source: %+v", src)
+	}
+	rows, err := st.VideoRows("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	byID := map[string]model.Video{}
+	for _, v := range rows {
+		byID[v.VideoID] = v
+	}
+	if v := byID["abcdefghijk"]; v.Status != model.StatusNew || v.Score != 0.9 || v.SourceID != srcID {
+		t.Errorf("yt row: %+v", v)
+	}
+	if v := byID["37c3-123"]; v.Status != model.StatusNew || v.Score != 0.4 || v.SourceID != srcID {
+		t.Errorf("ccc row: %+v", v)
+	}
+
+	// idempotent re-seed: same source id, no new rows, scores untouched
+	srcID2, queued2, err := a.seedResults(st, cands, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srcID2 != srcID {
+		t.Errorf("re-seed source id %d -> %d, want unchanged", srcID, srcID2)
+	}
+	if queued2 != 0 {
+		t.Errorf("re-seed queued = %d, want 0", queued2)
+	}
+	rows, _ = st.VideoRows("", 10)
+	if len(rows) != 2 {
+		t.Fatalf("re-seed rows = %d, want 2", len(rows))
+	}
+}
+
+// TestEnumOneSkipsDiscover: a discover source has no enumerator — enumOne
+// must no-op (nil error, zero rows) instead of failing.
+func TestEnumOneSkipsDiscover(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "vc.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srcID, err := st.AddSource(model.KindDiscover, discoverSeedURL, "", "discover", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := st.GetSource(srcID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{DBPath: dbPath}
+	lim := politeness.New(1500 * time.Millisecond)
+	if err := a.enumOne(context.Background(), time.Time{}, st, map[string]sites.Site{}, lim, src, 10); err != nil {
+		t.Fatalf("enumOne(discover): %v", err)
+	}
+	rows, _ := st.VideoRows("", 10)
+	if len(rows) != 0 {
+		t.Fatalf("enumOne created %d rows", len(rows))
 	}
 }
 

@@ -427,6 +427,9 @@ func (a *App) Enumerate(ctx context.Context, concurrency, limit int, onlySource 
 var errBudget = errors.New("round time budget exceeded")
 
 func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, cfgs map[string]sites.Site, lim *politeness.Limiter, src model.Source, limit int) error {
+	if src.Kind == model.KindDiscover {
+		return nil // discover sources are seeded statically by 'discover --seed'; nothing to enumerate
+	}
 	fn := enum.ForKind(src.Kind)
 	if fn == nil {
 		return fmt.Errorf("no enumerator for %s", src.Kind)
@@ -459,7 +462,7 @@ func (a *App) enumOne(ctx context.Context, deadline time.Time, st *store.Store, 
 		if !mostlyLatin(e.Title + " " + e.Channel) {
 			return nil // non-Latin script (Khmer/Arabic/...) — off-profile
 		}
-		if err := st.UpsertVideo(model.Video{
+		if _, err := st.UpsertVideo(model.Video{
 			SourceID:  src.ID,
 			VideoID:   e.VideoID,
 			URL:       e.URL,
@@ -587,18 +590,20 @@ func (a *App) CrawlLoop(ctx context.Context, every int, limit, workers, rounds i
 type uploadGate struct {
 	ids   map[int64]bool
 	sites map[string]bool
+	kinds map[string]bool
 }
 
 func (g *uploadGate) allows(src model.Source) bool {
-	return g.ids[src.ID] || g.sites[src.Site]
+	return g.ids[src.ID] || g.sites[src.Site] || g.kinds[src.Kind]
 }
 
 // parseUploadAllowlist parses --upload-allowlist: the token 'cc' (CC BY
-// verified: media.ccc.de, site 'ccc') and/or a comma list of numeric source
-// ids. An empty spec refuses everything (licensing discipline: no accidental
-// republishing of videos we have no right to mirror).
+// verified: media.ccc.de, site 'ccc'), 'pt' (peertube), 'disc' (discover
+// sources) and/or a comma list of numeric source ids. An empty spec refuses
+// everything (licensing discipline: no accidental republishing of videos we
+// have no right to mirror).
 func parseUploadAllowlist(spec string) (*uploadGate, error) {
-	g := &uploadGate{ids: map[int64]bool{}, sites: map[string]bool{}}
+	g := &uploadGate{ids: map[int64]bool{}, sites: map[string]bool{}, kinds: map[string]bool{}}
 	for _, tok := range strings.Split(spec, ",") {
 		tok = strings.TrimSpace(tok)
 		if tok == "" {
@@ -614,14 +619,21 @@ func parseUploadAllowlist(spec string) (*uploadGate, error) {
 			g.sites["peertube"] = true
 			continue
 		}
+		if tok == "disc" {
+			// discover sources: talks found by 'discover --seed' (ytsearch/HN/ccc
+			// search, corpus-driven), gated by the semantic title score at seed
+			// time and the transcript score at download time.
+			g.kinds[model.KindDiscover] = true
+			continue
+		}
 		id, err := strconv.ParseInt(tok, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("--upload-allowlist: unknown token %q (want 'cc', 'pt' or source ids)", tok)
+			return nil, fmt.Errorf("--upload-allowlist: unknown token %q (want 'cc', 'pt', 'disc' or source ids)", tok)
 		}
 		g.ids[id] = true
 	}
-	if len(g.ids) == 0 && len(g.sites) == 0 {
-		return nil, fmt.Errorf("upload refused: --upload-allowlist required (licensing discipline); pass 'cc' for CC BY (site=ccc) sources or a comma list of source ids")
+	if len(g.ids) == 0 && len(g.sites) == 0 && len(g.kinds) == 0 {
+		return nil, fmt.Errorf("upload refused: --upload-allowlist required (licensing discipline); pass 'cc' for CC BY (site=ccc) sources, 'pt'/'disc', or a comma list of source ids")
 	}
 	return g, nil
 }
@@ -647,10 +659,11 @@ func (a *App) Upload(limit int, dryRun bool, allowlist, pathPrefixRewrite, outDi
 		limit = 1 << 30
 	}
 	// Fetch with headroom so disallowed rows (youtube) can't starve the
-	// round: NextForUpload orders by earliest-published, and with limit=1 a
-	// single skipped row previously blocked everything behind it. The done
-	// queue is small (~100 rows), so 50x limit covers it; at most `limit`
-	// uploads still happen (the loop breaks at ok == limit).
+	// round: NextForUpload orders scored rows first (relevance desc), then
+	// by earliest-published, and with limit=1 a single skipped row previously
+	// blocked everything behind it. The done queue is small (~100 rows), so
+	// 50x limit covers it; at most `limit` uploads still happen (the loop
+	// breaks at ok == limit).
 	fetchN := limit * 50
 	if fetchN < 500 {
 		fetchN = 500
@@ -696,7 +709,9 @@ func (a *App) Upload(limit int, dryRun bool, allowlist, pathPrefixRewrite, outDi
 			continue
 		}
 		if !gate.allows(src) {
-			fmt.Fprintf(os.Stderr, "upload: SKIP %s (%s): source #%d site=%s not in allowlist\n", v.VideoID, v.URL, src.ID, src.Site)
+			// the gate is keyed on site (cc/pt) or kind (disc) or source id —
+			// report which dimension refused so the operator knows the fix.
+			fmt.Fprintf(os.Stderr, "upload: SKIP %s (%s): source #%d site=%s kind=%s not in allowlist\n", v.VideoID, v.URL, src.ID, src.Site, src.Kind)
 			skip++
 			continue
 		}

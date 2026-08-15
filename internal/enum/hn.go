@@ -29,9 +29,9 @@ type HNHit struct {
 type HNKind int
 
 const (
-	HNDrop HNKind = iota // not a video we can enumerate (or a lead with --include-known)
-	HNVideo              // a single talk video (youtube watch / media.ccc.de/v/)
-	HNSeed               // a youtube channel/playlist worth seeding
+	HNDrop  HNKind = iota // not a video we can enumerate (or a lead with --include-known)
+	HNVideo               // a single talk video (youtube watch / media.ccc.de/v/)
+	HNSeed                // a youtube channel/playlist worth seeding
 )
 
 // HNClassifyURL classifies a story URL: youtube watch links (watch?v=,

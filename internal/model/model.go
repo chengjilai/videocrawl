@@ -15,6 +15,7 @@ const (
 	KindArchiveAudio    = "archive-audio"    // archive.org mediatype:audio query (native downloads)
 	KindGallica         = "gallica"          // BnF Gallica ark PDF score (native download)
 	KindRSS             = "rss"              // feed URL with video enclosures
+	KindDiscover        = "discover"         // discover: static rows seeded by 'discover --seed' (topic-driven search results; no enumerator)
 )
 
 // Source: a seed to enumerate.
@@ -54,6 +55,10 @@ type Video struct {
 	// TranscriptScore: semantic relevance of the downloaded transcript
 	// against the reference corpus (0 = no transcript / unscored).
 	TranscriptScore float64
+	// Score: semantic relevance vs the reference corpus (0 = unscored legacy
+	// row). Scored rows are pulled by the download/upload queues in relevance
+	// order (desc) before unscored rows (which keep oldest-first).
+	Score float64
 }
 
 // Statuses.
