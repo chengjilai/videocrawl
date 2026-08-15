@@ -734,9 +734,13 @@ func (a *App) discoverHN(ctx context.Context, g *gates, lim *politeness.Limiter,
 			}
 			cands = append(cands, &c)
 		case enum.HNSeed:
-			seedLine(h.URL, h.Title)
+			// auto-seed passes nil callbacks (it has no use for HN
+			// channel/playlist suggestions) — guard them.
+			if seedLine != nil {
+				seedLine(h.URL, h.Title)
+			}
 		default:
-			if o.IncludeKnown {
+			if o.IncludeKnown && leadLine != nil {
 				leadLine(h.URL, h.Title)
 			}
 		}
