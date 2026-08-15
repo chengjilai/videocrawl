@@ -41,7 +41,11 @@ func Defaults() map[string]Site {
 			//   EnumArgs/DLArgs: ["--extractor-args", "youtube:player_client=tv"]
 			// approximate_date: channel-tab/UU flat entries otherwise lack
 			// upload_date, breaking the oldest-first queue order.
-			EnumArgs: []string{"--extractor-args", "youtubetab:approximate_date=true"},
+			// skip=authcheck: with the youtube session cookies present the
+			// tab extractor refuses playlist extraction without the skip
+			// (observed 2026-08-16 on source #22: "Playlists that require
+			// authentication may not extract correctly ...").
+			EnumArgs: []string{"--extractor-args", "youtubetab:approximate_date=true,skip=authcheck"},
 			DLArgs:   []string{},
 		},
 		"bilibili": {
