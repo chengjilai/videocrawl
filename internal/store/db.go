@@ -303,9 +303,12 @@ func (s *Store) UpsertMediaFiles(srcID int64, videoID string, files []model.Medi
 // (discover candidates) first in relevance order (score desc), then unscored
 // rows oldest published first (TubeSync lesson: oldest-first so a slow queue
 // doesn't starve old videos; also makes the crawl time-unbiased).
-// minDur/maxDur (seconds; 0 = unset) pre-filter on the KNOWN duration so
-// videos that would only be skipped later don't burn queue/limit slots.
-// duration=0 (unknown) always passes.
+// SOURCE FAIRNESS: the unscored pool is interleaved round-robin across
+// sources (within-source oldest-first preserved), so one large channel
+// (GOTO: 3.4k entries) cannot fill every round — the mix spreads across
+// sources. minDur/maxDur (seconds; 0 = unset) pre-filter on the KNOWN
+// duration so videos that would only be skipped later don't burn
+// queue/limit slots. duration=0 (unknown) always passes.
 func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, error) {
 	q := `SELECT source_id,video_id,url,title,duration,published,channel,status,attempts,last_error,size_bytes,path,sha256,bvid,fetched_at,transcript_score,score
 		 FROM videos WHERE status IN ('new','failed') AND attempts < 5`
@@ -322,14 +325,17 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 		}
 		q += `)`
 	}
+	// pull a pool 4× larger than the batch so the round-robin has rows from
+	// several sources to interleave (the pool itself is already ordered
+	// scored-first, then oldest-first).
 	q += ` ORDER BY (score>0) DESC, score DESC, (published='') ASC, published ASC, source_id, video_id LIMIT ?`
-	args = append(args, n)
+	args = append(args, n*4)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []model.Video
+	var pool []model.Video
 	for rows.Next() {
 		var v model.Video
 		if err := rows.Scan(&v.SourceID, &v.VideoID, &v.URL, &v.Title, &v.Duration,
@@ -337,9 +343,52 @@ func (s *Store) NextForDownload(n int, minDur, maxDur int64) ([]model.Video, err
 			&v.SizeBytes, &v.Path, &v.SHA256, &v.BVID, &v.FetchedAt, &v.TranscriptScore, &v.Score); err != nil {
 			return nil, err
 		}
-		out = append(out, v)
+		pool = append(pool, v)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// interleave: scored (relevance) rows first in pool order, then a
+	// round-robin drain across sources (ascending source id, one row per
+	// pass) preserving within-source oldest-first order.
+	bySource := map[int64][]model.Video{}
+	var sourceOrder []int64
+	seenSrc := map[int64]bool{}
+	for _, v := range pool {
+		if v.Score > 0 {
+			continue // scored rows are emitted first, directly from the pool
+		}
+		if !seenSrc[v.SourceID] {
+			seenSrc[v.SourceID] = true
+			sourceOrder = append(sourceOrder, v.SourceID)
+		}
+		bySource[v.SourceID] = append(bySource[v.SourceID], v)
+	}
+	out := make([]model.Video, 0, n)
+	for _, v := range pool {
+		if v.Score > 0 {
+			out = append(out, v)
+			if len(out) >= n {
+				return out, nil
+			}
+		}
+	}
+	for i := 0; len(out) < n; i++ {
+		added := false
+		for _, sid := range sourceOrder {
+			if i < len(bySource[sid]) {
+				out = append(out, bySource[sid][i])
+				added = true
+				if len(out) >= n {
+					return out, nil
+				}
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	return out, nil
 }
 
 // NextForUpload returns up to n downloaded videos not yet republished:

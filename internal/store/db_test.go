@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -591,5 +592,40 @@ func TestMetaSetGet(t *testing.T) {
 	}
 	if got := s.MetaGet("k"); got != "v2" {
 		t.Errorf("MetaGet after update = %q, want v2", got)
+	}
+}
+
+// TestNextForDownloadSourceFairness: two sources with plenty of rows each —
+// the batch must interleave round-robin (one per source per pass), not fill
+// from the first source.
+func TestNextForDownloadSourceFairness(t *testing.T) {
+	st, err := Open(t.TempDir() + "/f.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ins := func(src int64, id, pub string) {
+		if _, err := st.UpsertVideo(model.Video{SourceID: src, VideoID: id,
+			URL: "https://youtu.be/" + id, Title: "t " + id, Published: pub}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		ins(1, fmt.Sprintf("a%03d", i), fmt.Sprintf("2020-01-%02d", i+1)) // older
+		ins(2, fmt.Sprintf("b%03d", i), fmt.Sprintf("2021-01-%02d", i+1))
+	}
+	got, err := st.NextForDownload(6, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 6 {
+		t.Fatalf("want 6 rows, got %d", len(got))
+	}
+	// expected: a000,b000,a001,b001,a002,b002 (round-robin by source)
+	for i, v := range got {
+		want := int64(1 + i%2)
+		if v.SourceID != want {
+			t.Fatalf("row %d: source %d, want %d (interleave broken: %+v)", i, v.SourceID, want, got)
+		}
 	}
 }
