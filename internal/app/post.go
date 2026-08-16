@@ -516,6 +516,11 @@ func PostLoop(args []string) error {
 			if title == "" {
 				title = it.ID
 			}
+			// the uploader hard-fails above 80 runes; archive.org ids like
+			// 78_study-...-g_bia0190025a exceed that when used as the title
+			// (Title was empty — observed 2026-08-16: exit status 1 "title
+			// too long" after a successful staging).
+			title = uploadTitle(title)
 			tags := "古典音乐,历史录音"
 			for _, w := range strings.Fields(title) {
 				w = strings.Trim(w, "【】（）()[]——,.:。 ")
